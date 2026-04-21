@@ -12,6 +12,7 @@ Failure in one layer does not crash others.
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 import signal
 import sys
@@ -43,6 +44,7 @@ class Transcript:
     text: str
     duration_ms: float
     timestamp: float
+    stt_latency_ms: float = 0.0
 
 
 @dataclass
@@ -281,6 +283,7 @@ class VoicePipeline:
                     text=transcript_text.strip(),
                     duration_ms=segment.duration_ms,
                     timestamp=time.monotonic(),
+                    stt_latency_ms=stt_latency,
                 )
 
                 try:
@@ -300,7 +303,7 @@ class VoicePipeline:
     async def _conversation_layer(self) -> None:
         """
         Consumes transcripts, routes through conversation engine.
-        Handles shortcuts, intent detection, and LLM calls.
+        Uses streaming: sends sentence-level chunks to TTS as they arrive.
         """
         while self._running:
             try:
@@ -314,26 +317,55 @@ class VoicePipeline:
 
             try:
                 latency_start = time.monotonic()
-                result = await self.conversation.process(transcript.text)
+                first_result = None
+                first_chunk_ms = 0.0
+                full_text_parts: list[str] = []
+
+                async for result in self.conversation.process_stream(transcript.text):
+                    if first_result is None:
+                        first_result = result
+                        first_chunk_ms = (time.monotonic() - latency_start) * 1000
+
+                    full_text_parts.append(result.text)
+                    try:
+                        self._tts_queue.put_nowait(Response(
+                            text=result.text,
+                            is_shortcut=result.is_shortcut,
+                            timestamp=time.monotonic(),
+                        ))
+                    except asyncio.QueueFull:
+                        logger.warning("[ENGINE] TTS queue full -- dropping chunk")
+
                 engine_latency = (time.monotonic() - latency_start) * 1000
+                total_latency = transcript.stt_latency_ms + engine_latency
 
-                logger.info("[ENGINE] %r → %r (%.0fms)",
-                            transcript.text, result.text, engine_latency)
+                if first_result:
+                    full_text = " ".join(full_text_parts)
+                    logger.info("[ENGINE] %r -> %r (%.0fms, first_chunk=%.0fms)",
+                                transcript.text, full_text, engine_latency, first_chunk_ms)
 
-                response = Response(
-                    text=result.text,
-                    is_shortcut=result.is_shortcut,
-                    timestamp=time.monotonic(),
-                )
-
-                try:
-                    self._tts_queue.put_nowait(response)
-                except asyncio.QueueFull:
-                    logger.warning("[ENGINE] TTS queue full — dropping response")
+                    state = self.conversation.state
+                    turn_metric = {
+                        "turn_id": state.turn_count,
+                        "language": state.language,
+                        "lang_confidence": round(state.lang_confidence, 2),
+                        "lang_source": state.lang_source,
+                        "intent": first_result.intent,
+                        "stage": state.stage,
+                        "stt_latency_ms": round(transcript.stt_latency_ms),
+                        "llm_latency_ms": round(engine_latency),
+                        "first_chunk_ms": round(first_chunk_ms),
+                        "response_length": len(full_text),
+                        "total_latency_ms": round(total_latency),
+                        "filler_used": state.filler_used,
+                        "llm_cancelled": state.llm_cancelled,
+                        "parallel_execution": state.parallel_execution,
+                        "objection_handled": state.objection_handled,
+                    }
+                    logger.info("[TURN_METRIC] %s", json.dumps(turn_metric))
 
             except Exception:
                 logger.exception("[ENGINE] Processing failed")
-                # Fallback response
                 try:
                     self._tts_queue.put_nowait(Response(
                         text="Sorry, could you say that again?",

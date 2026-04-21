@@ -12,7 +12,7 @@ import logging
 
 import httpx
 
-from .base import STTProvider, pcm_to_wav
+from .base import STTProvider, STTResult, pcm_to_wav
 
 logger = logging.getLogger(__name__)
 
@@ -56,7 +56,7 @@ class SarvamSTT(STTProvider):
         audio_bytes: bytes,
         sample_rate: int = 16_000,
         language: str = "en",
-    ) -> str:
+    ) -> STTResult:
         wav_data = pcm_to_wav(audio_bytes, sample_rate=sample_rate)
         duration_ms = len(audio_bytes) // (sample_rate * 2) * 1000
         logger.info("[STT:Sarvam] Sending %d bytes (%.0fms) for transcription", len(wav_data), duration_ms)
@@ -90,8 +90,9 @@ class SarvamSTT(STTProvider):
 
         data = response.json()
         transcript = data.get("transcript", "").strip()
-        logger.info("[STT:Sarvam] Transcript: %r", transcript)
-        return transcript
+        confidence = float(data.get("confidence", 1.0))
+        logger.info("[STT:Sarvam] Transcript: %r (confidence=%.2f)", transcript, confidence)
+        return STTResult(text=transcript, confidence=confidence)
 
     async def close(self) -> None:
         if self._client:

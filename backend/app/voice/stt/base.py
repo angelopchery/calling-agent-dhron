@@ -12,8 +12,16 @@ import io
 import wave
 import logging
 from abc import ABC, abstractmethod
+from dataclasses import dataclass
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class STTResult:
+    """STT transcription result with confidence score."""
+    text: str
+    confidence: float = 1.0
 
 
 def pcm_to_wav(
@@ -47,7 +55,7 @@ class STTProvider(ABC):
         audio_bytes: bytes,
         sample_rate: int = 16_000,
         language: str = "en",
-    ) -> str:
+    ) -> STTResult:
         """
         Transcribe raw PCM16 audio to text.
 
@@ -62,7 +70,7 @@ class STTProvider(ABC):
 
         Returns
         -------
-        str
-            The transcript. Empty string if nothing was recognised.
+        STTResult
+            Transcript text and confidence score.
         """
         ...

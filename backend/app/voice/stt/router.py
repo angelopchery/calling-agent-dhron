@@ -1,15 +1,17 @@
 """
 STT Router — tries primary provider, falls back to secondary on failure.
 
-Includes retry logic and minimum-confidence filtering (rejects transcripts
-that are too short to be meaningful).
+Includes retry logic, minimum-confidence filtering, transcript validation,
+and hallucination filtering.
 """
 
 from __future__ import annotations
 
+import re
 import logging
+from collections import Counter
 
-from .base import STTProvider
+from .base import STTProvider, STTResult
 from .sarvam import SarvamSTT
 from .openai_whisper import OpenAIWhisperSTT
 
@@ -17,6 +19,66 @@ logger = logging.getLogger(__name__)
 
 MIN_TRANSCRIPT_LENGTH = 2
 MAX_RETRIES = 1
+MIN_CONFIDENCE = 0.4
+
+_FILLER_WORDS = {"um", "uh", "like", "you know"}
+_FILLER_RE = re.compile(
+    r"\b(?:" + "|".join(re.escape(w) for w in _FILLER_WORDS) + r")\b",
+    re.IGNORECASE,
+)
+
+_HALLUCINATIONS = [
+    "thank you for watching",
+    "thanks for watching",
+    "subscribe",
+    "like and subscribe",
+    "please subscribe",
+    "thanks for listening",
+]
+
+_REPETITION_THRESHOLD = 0.6
+
+
+def validate_transcript(text: str) -> str:
+    """
+    Clean and validate an STT transcript. Returns empty string to reject.
+
+    Steps: normalize -> strip fillers -> reject short -> reject hallucinations
+    -> reject excessive repetition.
+    """
+    if not text:
+        return ""
+
+    # Normalize
+    cleaned = text.lower().strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+
+    # Strip filler words
+    cleaned = _FILLER_RE.sub("", cleaned).strip()
+    cleaned = re.sub(r"\s+", " ", cleaned)
+
+    # Length check
+    if len(cleaned) < 2:
+        logger.info("[STT-FILTER] reason=too_short text=%r", text)
+        return ""
+
+    # Hallucination filter
+    for hallucination in _HALLUCINATIONS:
+        if hallucination in cleaned:
+            logger.info("[STT-FILTER] reason=hallucination text=%r match=%r", text, hallucination)
+            return ""
+
+    # Repetition check: if >60% of words are the same word
+    words = cleaned.split()
+    if len(words) >= 3:
+        counts = Counter(words)
+        most_common_count = counts.most_common(1)[0][1]
+        if most_common_count / len(words) > _REPETITION_THRESHOLD:
+            logger.info("[STT-FILTER] reason=repetition text=%r ratio=%.2f",
+                        text, most_common_count / len(words))
+            return ""
+
+    return cleaned
 
 
 class STTRouter:
@@ -37,11 +99,13 @@ class STTRouter:
         fallback: STTProvider | None = None,
         min_length: int = MIN_TRANSCRIPT_LENGTH,
         max_retries: int = MAX_RETRIES,
+        min_confidence: float = MIN_CONFIDENCE,
     ) -> None:
         self._primary = primary or SarvamSTT()
         self._fallback = fallback or OpenAIWhisperSTT()
         self._min_length = min_length
         self._max_retries = max_retries
+        self._min_confidence = min_confidence
 
     async def transcribe(
         self,
@@ -80,13 +144,27 @@ class STTRouter:
     ) -> str:
         for attempt in range(1, self._max_retries + 2):
             try:
-                text = await provider.transcribe(audio_bytes, sample_rate, language)
-                if len(text) >= self._min_length:
-                    return text
-                logger.info(
-                    "[STT] %s returned short transcript %r (attempt %d) — treating as empty",
-                    label, text, attempt,
-                )
+                result = await provider.transcribe(audio_bytes, sample_rate, language)
+                text = result.text
+                confidence = result.confidence
+
+                if confidence < self._min_confidence:
+                    logger.info(
+                        "[STT-FILTER] reason=low_confidence score=%.2f text=%r provider=%s attempt=%d",
+                        confidence, text, label, attempt,
+                    )
+                    continue
+
+                if len(text) < self._min_length:
+                    logger.info(
+                        "[STT] %s returned short transcript %r (attempt %d) -- treating as empty",
+                        label, text, attempt,
+                    )
+                else:
+                    validated = validate_transcript(text)
+                    if validated:
+                        return validated
+                    logger.info("[STT] %s transcript rejected by validation (attempt %d)", label, attempt)
             except Exception as exc:
                 logger.warning(
                     "[STT] %s attempt %d failed: %s", label, attempt, exc,
