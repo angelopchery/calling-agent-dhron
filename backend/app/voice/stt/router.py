@@ -14,6 +14,7 @@ from collections import Counter
 from .base import STTProvider, STTResult
 from .sarvam import SarvamSTT
 from .openai_whisper import OpenAIWhisperSTT
+from .post_processor import post_process_transcript
 
 logger = logging.getLogger(__name__)
 
@@ -34,9 +35,25 @@ _HALLUCINATIONS = [
     "like and subscribe",
     "please subscribe",
     "thanks for listening",
+    "youtube originals",
+    "youtube",
+]
+
+_DEVANAGARI_HALLUCINATIONS = [
+    "प्रस्तुत",
+    "यूट्यूब",
+    "ओरिजिनल्स",
+    "सबस्क्राइब",
+    "परमओत",
 ]
 
 _REPETITION_THRESHOLD = 0.6
+
+_REPEATED_CHAR_RE = re.compile(r"^(.{1,3}[- ]?)\1{2,}[-]?$")
+
+_GARBAGE_SINGLE_WORDS = {
+    "shoe", "care", "shoes", "show", "sure",
+}
 
 
 def validate_transcript(text: str) -> str:
@@ -68,6 +85,18 @@ def validate_transcript(text: str) -> str:
             logger.info("[STT-FILTER] reason=hallucination text=%r match=%r", text, hallucination)
             return ""
 
+    # Repeated character/syllable patterns like "s-s-s-s-s-" or "na na na"
+    if _REPEATED_CHAR_RE.match(cleaned):
+        logger.info("[STT-FILTER] reason=repeated_pattern text=%r", text)
+        return ""
+
+    # Devanagari hallucination filter
+    for hallucination in _DEVANAGARI_HALLUCINATIONS:
+        if hallucination in text:
+            logger.info("[STT-FILTER] reason=devanagari_hallucination text=%r match=%r",
+                        text, hallucination)
+            return ""
+
     # Repetition check: if >60% of words are the same word
     words = cleaned.split()
     if len(words) >= 3:
@@ -77,6 +106,11 @@ def validate_transcript(text: str) -> str:
             logger.info("[STT-FILTER] reason=repetition text=%r ratio=%.2f",
                         text, most_common_count / len(words))
             return ""
+
+    # Single-word garbage: common misrecognitions from noise
+    if len(words) == 1 and cleaned in _GARBAGE_SINGLE_WORDS:
+        logger.info("[STT-FILTER] reason=garbage_single_word text=%r", text)
+        return ""
 
     return cleaned
 
@@ -134,6 +168,11 @@ class STTRouter:
         logger.warning("[STT] Both providers failed — returning empty transcript")
         return ""
 
+    def _post_process(self, text: str, language: str) -> str:
+        if not text:
+            return text
+        return post_process_transcript(text, language)
+
     async def _try_provider(
         self,
         provider: STTProvider,
@@ -163,7 +202,7 @@ class STTRouter:
                 else:
                     validated = validate_transcript(text)
                     if validated:
-                        return validated
+                        return self._post_process(validated, language)
                     logger.info("[STT] %s transcript rejected by validation (attempt %d)", label, attempt)
             except Exception as exc:
                 logger.warning(

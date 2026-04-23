@@ -23,6 +23,7 @@ from .audio_input import AudioInputStream, MicrophoneStream, SAMPLE_RATE, SAMPLE
 from .vad import VoiceActivityDetector
 from .stt.router import STTRouter
 from .tts_stream import StreamingTTS, MockStreamingTTS
+from .tts_sarvam import SarvamTTS
 from .turn_manager import TurnManager, TurnManagerConfig
 from .conversation import ConversationRouter
 from .memory import ConversationMemory
@@ -60,11 +61,13 @@ QUEUE_SIZE_STT = 5
 QUEUE_SIZE_TRANSCRIPT = 5
 QUEUE_SIZE_TTS = 5
 
-MAX_SPEECH_SECONDS = 7
+MAX_SPEECH_SECONDS = 4
 MAX_BUFFER_BYTES = SAMPLE_RATE * 2 * MAX_SPEECH_SECONDS
-MIN_SPEECH_MS = 300.0
-BARGE_IN_COOLDOWN_MS = 300.0
-BARGE_IN_MIN_FRAMES = 12  # 240ms of sustained speech to interrupt
+MIN_SPEECH_MS = 250.0
+BARGE_IN_COOLDOWN_MS = 400.0
+BARGE_IN_MIN_FRAMES = 18  # 360ms sustained speech to interrupt (reduces false triggers)
+TTS_ECHO_COOLDOWN_MS = 250.0  # suppress VAD after TTS ends to avoid echo tail triggers
+TTS_ONSET_DEBOUNCE = 6  # require 6 frames (120ms) onset during/after TTS (vs 3 normally)
 
 
 class VoicePipeline:
@@ -86,7 +89,7 @@ class VoicePipeline:
         self.audio = audio_source or MicrophoneStream()
         self.vad = vad or VoiceActivityDetector()
         self.stt = stt or STTRouter()
-        self.tts = tts or MockStreamingTTS()
+        self.tts = tts or SarvamTTS()
         self.conversation = conversation or ConversationRouter()
 
         # Inter-layer queues
@@ -99,6 +102,7 @@ class VoicePipeline:
         self._tasks: list[asyncio.Task] = []
         self._tts_playing = False
         self._tts_start_time = 0.0
+        self._tts_end_time = 0.0
 
         # VAD + buffering state
         self._audio_buffer = bytearray()
@@ -106,13 +110,15 @@ class VoicePipeline:
         self._prev_speech = False
         self._speech_frame_streak = 0
         self._frame_count = 0
+        self._speech_onset_frames = 0  # debounce: frames since speech started
+        self._silence_frames = 0       # debounce: frames since last speech
 
-        # Turn manager
+        # Turn manager — tuned for phone call cadence
         self._turn = TurnManager(TurnManagerConfig(
-            silence_threshold_ms=600.0,
-            grace_window_ms=150.0,
-            min_words_short=2,
-            min_words_long=4,
+            silence_threshold_ms=450.0,
+            grace_window_ms=80.0,
+            min_words_short=1,
+            min_words_long=2,
         ))
 
     async def start(self) -> None:
@@ -127,6 +133,8 @@ class VoicePipeline:
             asyncio.create_task(self._conversation_layer(), name="conversation"),
             asyncio.create_task(self._tts_layer(), name="tts"),
         ]
+
+        logger.info("[PIPELINE] Waiting for user to speak first")
 
     async def stop(self) -> None:
         self._running = False
@@ -185,7 +193,34 @@ class VoicePipeline:
             logger.info("[AUDIO] Layer stopped (%d frames)", self._frame_count)
 
     async def _process_vad_frame(self, frame: bytes) -> None:
-        speech = self.vad.is_speech(frame)
+        raw_speech = self.vad.is_speech(frame)
+
+        # --- Echo suppression: ignore VAD during post-TTS cooldown ---
+        if not self._tts_playing and self._tts_end_time > 0:
+            echo_elapsed = (time.monotonic() - self._tts_end_time) * 1000
+            if echo_elapsed < TTS_ECHO_COOLDOWN_MS:
+                self._prev_speech = False
+                self._speech_onset_frames = 0
+                self._silence_frames = 0
+                return
+
+        # --- Debounce: require 3 consecutive frames (60ms) to confirm onset,
+        #     and 5 consecutive silence frames (100ms) to confirm end ---
+        if raw_speech:
+            self._speech_onset_frames += 1
+            self._silence_frames = 0
+        else:
+            self._silence_frames += 1
+            self._speech_onset_frames = 0
+
+        # Debounced speech state — stricter onset during/near TTS to reject echo
+        onset_threshold = TTS_ONSET_DEBOUNCE if self._tts_playing else 3
+        if raw_speech and self._speech_onset_frames < onset_threshold and not self._prev_speech:
+            speech = False  # not yet confirmed
+        elif not raw_speech and self._silence_frames < 5 and self._prev_speech:
+            speech = True   # hold speech state through short gaps
+        else:
+            speech = raw_speech
 
         # --- Barge-in with sustained speech requirement ---
         if speech and self._tts_playing:
@@ -198,6 +233,15 @@ class VoicePipeline:
                     await self.tts.stop()
                     self._tts_playing = False
                     self._speech_frame_streak = 0
+                    drained = 0
+                    while not self._tts_queue.empty():
+                        try:
+                            self._tts_queue.get_nowait()
+                            drained += 1
+                        except asyncio.QueueEmpty:
+                            break
+                    if drained:
+                        logger.info("[BARGE-IN] Drained %d stale TTS responses", drained)
         elif not speech:
             self._speech_frame_streak = 0
 
@@ -209,13 +253,11 @@ class VoicePipeline:
             self._audio_buffer.extend(frame)
             self._speech_duration_ms += 20.0
 
-            # Cap buffer
             if len(self._audio_buffer) > MAX_BUFFER_BYTES:
                 del self._audio_buffer[:len(self._audio_buffer) - MAX_BUFFER_BYTES]
 
-            # Feed turn manager
-            proxy_words = max(1, int(self._speech_duration_ms / 200))
-            self._turn.update_text(" ".join(["w"] * proxy_words))
+            proxy_words = max(1, int(self._speech_duration_ms / 300))
+            self._turn.update_text(" ".join(["x"] * proxy_words))
         else:
             if self._prev_speech:
                 logger.info("[VAD] Speech end (%.0fms)", self._speech_duration_ms)
@@ -268,8 +310,9 @@ class VoicePipeline:
 
             try:
                 latency_start = time.monotonic()
+                language = self.conversation.state.language if self.conversation else "en"
                 transcript_text = await self.stt.transcribe(
-                    segment.audio, sample_rate=SAMPLE_RATE
+                    segment.audio, sample_rate=SAMPLE_RATE, language=language
                 )
                 stt_latency = (time.monotonic() - latency_start) * 1000
 
@@ -403,6 +446,10 @@ class VoicePipeline:
                 self._tts_playing = True
                 self._tts_start_time = time.monotonic()
 
+                # Pass current conversation language to TTS
+                if hasattr(self.tts, 'set_language') and self.conversation:
+                    self.tts.set_language(self.conversation.state.language)
+
                 await self.tts.speak(response.text)
 
             except asyncio.CancelledError:
@@ -411,5 +458,6 @@ class VoicePipeline:
                 logger.exception("[TTS] Playback failed")
             finally:
                 self._tts_playing = False
+                self._tts_end_time = time.monotonic()
 
         logger.info("[TTS] Layer stopped")

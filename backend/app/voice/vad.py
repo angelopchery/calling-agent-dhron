@@ -42,8 +42,8 @@ class VoiceActivityDetector:
         sample_rate: int = 16_000,
         energy_threshold: float | None = None,
         calibration_frames: int = 25,
-        calibration_multiplier: float = 3.0,
-        minimum_threshold: float = 2.0,
+        calibration_multiplier: float = 3.5,
+        minimum_threshold: float = 3.0,
     ) -> None:
         self.sample_rate = sample_rate
         self._threshold: float = energy_threshold or 0.0
