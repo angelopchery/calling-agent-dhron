@@ -65,9 +65,9 @@ MAX_SPEECH_SECONDS = 4
 MAX_BUFFER_BYTES = SAMPLE_RATE * 2 * MAX_SPEECH_SECONDS
 MIN_SPEECH_MS = 250.0
 BARGE_IN_COOLDOWN_MS = 400.0
-BARGE_IN_MIN_FRAMES = 18  # 360ms sustained speech to interrupt (reduces false triggers)
-TTS_ECHO_COOLDOWN_MS = 250.0  # suppress VAD after TTS ends to avoid echo tail triggers
-TTS_ONSET_DEBOUNCE = 6  # require 6 frames (120ms) onset during/after TTS (vs 3 normally)
+BARGE_IN_MIN_FRAMES = 25  # 500ms sustained speech to interrupt (reduces false triggers from echo)
+TTS_ECHO_COOLDOWN_MS = 500.0  # suppress VAD after TTS ends to avoid echo tail triggers
+TTS_ONSET_DEBOUNCE = 8  # require 8 frames (160ms) onset during/after TTS (vs 3 normally)
 
 
 class VoicePipeline:
@@ -134,7 +134,17 @@ class VoicePipeline:
             asyncio.create_task(self._tts_layer(), name="tts"),
         ]
 
-        logger.info("[PIPELINE] Waiting for user to speak first")
+        # Agent speaks first — bilingual greeting
+        opening = await self.conversation.generate_opening()
+        try:
+            self._tts_queue.put_nowait(Response(
+                text=opening.text,
+                is_shortcut=True,
+                timestamp=time.monotonic(),
+            ))
+            logger.info("[PIPELINE] Agent opening: %r", opening.text)
+        except asyncio.QueueFull:
+            logger.warning("[PIPELINE] Could not enqueue opening greeting")
 
     async def stop(self) -> None:
         self._running = False

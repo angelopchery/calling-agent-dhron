@@ -7,6 +7,9 @@ Sources:
 
 All sources yield fixed-size PCM16 mono frames through the same
 async iterator interface so downstream components are source-agnostic.
+
+Includes a built-in noise suppression filter (NoiseGate) that runs
+inline on every frame before it reaches VAD/STT.
 """
 
 from __future__ import annotations
@@ -22,6 +25,80 @@ SAMPLE_RATE = 16_000
 FRAME_DURATION_MS = 20
 SAMPLES_PER_FRAME = SAMPLE_RATE * FRAME_DURATION_MS // 1000
 BYTES_PER_FRAME = SAMPLES_PER_FRAME * 2  # 16-bit mono PCM
+
+
+# ---------------------------------------------------------------------------
+# Noise suppression — spectral noise gate with adaptive floor
+# ---------------------------------------------------------------------------
+
+class NoiseGate:
+    """
+    Adaptive spectral noise gate for reducing background noise.
+
+    Learns the noise floor from the first `calibration_frames` frames,
+    then applies per-frequency-bin attenuation: energy below the noise
+    floor is suppressed, energy above it passes through with smooth
+    gain transitions to avoid artefacts.
+    """
+
+    def __init__(
+        self,
+        calibration_frames: int = 30,
+        suppression_factor: float = 0.08,
+        smoothing_alpha: float = 0.15,
+        gate_threshold_multiplier: float = 2.5,
+    ) -> None:
+        self._calibration_frames = calibration_frames
+        self._suppression_factor = suppression_factor
+        self._smoothing_alpha = smoothing_alpha
+        self._gate_threshold_mult = gate_threshold_multiplier
+
+        self._noise_spectrum: np.ndarray | None = None
+        self._calibration_spectra: list[np.ndarray] = []
+        self._calibrated = False
+        self._prev_gain: np.ndarray | None = None
+        self._frame_count = 0
+
+    @property
+    def calibrated(self) -> bool:
+        return self._calibrated
+
+    def process(self, pcm16: np.ndarray) -> np.ndarray:
+        """Process a PCM16 frame, returning noise-suppressed PCM16."""
+        self._frame_count += 1
+        audio_f = pcm16.astype(np.float32)
+        spectrum = np.abs(np.fft.rfft(audio_f))
+
+        if not self._calibrated:
+            self._calibration_spectra.append(spectrum)
+            if len(self._calibration_spectra) >= self._calibration_frames:
+                self._finish_calibration()
+            return pcm16
+
+        threshold = self._noise_spectrum * self._gate_threshold_mult
+        gain = np.ones_like(spectrum)
+        below = spectrum < threshold
+        gain[below] = self._suppression_factor
+
+        if self._prev_gain is not None:
+            gain = self._smoothing_alpha * gain + (1 - self._smoothing_alpha) * self._prev_gain
+        self._prev_gain = gain.copy()
+
+        fft_data = np.fft.rfft(audio_f)
+        fft_data *= gain
+        result = np.fft.irfft(fft_data, n=len(audio_f))
+        return np.clip(result, -32768, 32767).astype(np.int16)
+
+    def _finish_calibration(self) -> None:
+        stacked = np.stack(self._calibration_spectra)
+        self._noise_spectrum = np.percentile(stacked, 75, axis=0)
+        self._calibrated = True
+        self._calibration_spectra.clear()
+        logger.info(
+            "[NOISE_GATE] Calibrated from %d frames — noise floor mean=%.1f",
+            self._calibration_frames,
+            float(self._noise_spectrum.mean()),
+        )
 
 
 class AudioInputStream:
@@ -75,6 +152,7 @@ class MicrophoneStream(AudioInputStream):
         sample_rate: int = SAMPLE_RATE,
         frame_duration_ms: int = FRAME_DURATION_MS,
         queue_max_size: int = 200,
+        noise_suppression: bool = True,
     ) -> None:
         super().__init__(sample_rate=sample_rate, frame_duration_ms=frame_duration_ms)
         self._device = device
@@ -84,6 +162,7 @@ class MicrophoneStream(AudioInputStream):
         self._overflow_count = 0
         self._frame_count = 0
         self._debug_interval = 250  # log raw values every 250 frames (5s)
+        self._noise_gate = NoiseGate() if noise_suppression else None
 
     async def start(self) -> None:
         import sounddevice as sd
@@ -131,7 +210,10 @@ class MicrophoneStream(AudioInputStream):
         if indata.dtype == np.float32:
             pcm16 = (indata * 32767).astype(np.int16)
         else:
-            pcm16 = indata
+            pcm16 = indata.copy()
+
+        if self._noise_gate is not None:
+            pcm16 = self._noise_gate.process(pcm16.flatten()).reshape(pcm16.shape)
 
         pcm_bytes = pcm16.tobytes()
 

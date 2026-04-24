@@ -2,11 +2,14 @@
 Pramukh Group — proactive outbound calling agent.
 
 Drives conversation through a structured appointment booking flow:
-  GREETING -> LOCATION -> PROPERTY_TYPE -> SCHEDULING -> CONFIRMATION -> CLOSING
+  GREETING -> INTEREST_CONFIRM -> (INTEREST_RECONFIRM) -> LOCATION
+  -> PROPERTY_TYPE -> SCHEDULING -> CONFIRMATION -> CLOSING
 
-The agent leads, the user responds. At any point, user questions are
-answered and the flow resumes. Uses parallel LLM execution, filler
-responses, and deterministic shortcuts for low latency.
+Agent goes first with bilingual greeting ("Hello, Namaste!").
+User's language is detected from their response and mirrored.
+Interest is confirmed before advancing to the booking flow.
+Uses parallel LLM execution, filler responses, and deterministic
+shortcuts for low latency.
 """
 
 from __future__ import annotations
@@ -28,6 +31,8 @@ from .stt.post_processor import match_location, match_bhk
 # ---------------------------------------------------------------------------
 
 STAGE_GREETING = "GREETING"
+STAGE_INTEREST_CONFIRM = "INTEREST_CONFIRM"
+STAGE_INTEREST_RECONFIRM = "INTEREST_RECONFIRM"
 STAGE_LOCATION = "LOCATION"
 STAGE_PROPERTY_TYPE = "PROPERTY_TYPE"
 STAGE_SCHEDULING = "SCHEDULING"
@@ -36,20 +41,22 @@ STAGE_CLOSING = "CLOSING"
 
 _STAGE_ORDER = {
     STAGE_GREETING: 0,
-    STAGE_LOCATION: 1,
-    STAGE_PROPERTY_TYPE: 2,
-    STAGE_SCHEDULING: 3,
-    STAGE_CONFIRMATION: 4,
-    STAGE_CLOSING: 5,
+    STAGE_INTEREST_CONFIRM: 1,
+    STAGE_INTEREST_RECONFIRM: 2,
+    STAGE_LOCATION: 3,
+    STAGE_PROPERTY_TYPE: 4,
+    STAGE_SCHEDULING: 5,
+    STAGE_CONFIRMATION: 6,
+    STAGE_CLOSING: 7,
 }
 
 # ---------------------------------------------------------------------------
 # Constants
 # ---------------------------------------------------------------------------
 
-MAX_RESPONSE_LENGTH = 200
+MAX_RESPONSE_LENGTH = 350
 LLM_TIMEOUT = 5.0
-LLM_MAX_TOKENS = 80
+LLM_MAX_TOKENS = 150
 FILLER_TIMEOUT_S = 1.5
 LLM_STREAM_TIMEOUT_S = 4.0
 INTENT_CLASSIFY_TIMEOUT_S = 1.0
@@ -77,7 +84,7 @@ class ConversationState:
         self.last_intent: str | None = None
         self.turn_count: int = 0
         self.is_closing: bool = False
-        self.language: str = "en"
+        self.language: str = "hi"
         self.language_history: list[str] = []
         self.stage: str = STAGE_GREETING
         self.lang_confidence: float = 1.0
@@ -146,6 +153,27 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
                                   "રસ નથી", "વ્યસ્ત", "જરૂર નથી"]):
         return "objection"
 
+    # Language switch request — "hindi me baat karo", "can you speak english", etc.
+    _lang_switch_phrases = [
+        "hindi me", "hindi mai", "hindi mein", "hindi boliye", "hindi bolo",
+        "hindi me baat", "hindi mai baat", "hindi mein baat",
+        "english me", "english mai", "english mein", "english boliye", "english bolo",
+        "english me baat", "english mai baat", "english mein baat",
+        "gujarati ma", "gujarati mai", "gujarati mein", "gujarati boliye", "gujarati bolo",
+        "gujarati ma vaat", "gujarati mai baat",
+        "speak hindi", "speak english", "speak gujarati",
+        "talk in hindi", "talk in english", "talk in gujarati",
+        "speak in hindi", "speak in english", "speak in gujarati",
+        "switch to hindi", "switch to english", "switch to gujarati",
+    ]
+    if any(p in lower for p in _lang_switch_phrases):
+        return "language_switch"
+    if any(w in lower for w in [
+        "हिंदी में", "अंग्रेज़ी में", "अंग्रेजी में",
+        "ગુજરાતીમાં", "અંગ્રેજીમાં", "હિન્દીમાં",
+    ]):
+        return "language_switch"
+
     # Location selection
     loc = match_location(lower)
     if loc:
@@ -170,11 +198,41 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
     if any(w in lower for w in ["हां", "हाँ", "जी", "ठीक", "હા", "બરાબર"]):
         return "affirmation"
 
+    # Identity question — "who is this", "kon bol raha hai", etc.
+    # Highest priority among questions — gets a fast deterministic response
+    _identity_phrases = [
+        "who is this", "who are you", "who is calling", "who is speaking",
+        "who am i speaking", "who am i talking",
+        "which company", "what company", "where are you calling from",
+        "where you calling from", "kahan se", "kis taraf se",
+        "kon hai", "kaun hai", "kon bol", "kaun bol", "kon baat", "kaun baat",
+        "aap kon", "aap kaun", "ap kon", "ap kaun", "tum kon", "tum kaun",
+        "ye kon", "ye kaun", "yeh kon", "yeh kaun",
+        "tame kon", "tame kaun", "aa kon", "aa kaun",
+        "kon che", "kaun che", "kon bole che", "kon baat kar",
+        "kidhar se", "kahan se bol",
+    ]
+    # Also check Devanagari/Gujarati script identity questions
+    if any(w in lower for w in [
+        "कौन है", "कौन बोल", "कौन बात", "आप कौन", "ये कौन", "कहां से",
+        "કોણ છે", "કોણ બોલ", "કોણ વાત", "તમે કોણ", "ક્યાંથી",
+    ]):
+        return "identity_question"
+    if any(p in lower for p in _identity_phrases):
+        return "identity_question"
+
     # Question — check before negation so कितना isn't caught by ना substring
-    if lower.endswith("?") or re.search(r"\b(what|how|when|where|why|which|kitna|kab|kahan|kaun|kya|kyun)\b", lower):
+    if lower.endswith("?") or re.search(r"\b(what|how|when|where|why|which|who|kitna|kab|kahan|kaun|kya|kyun|kon)\b", lower):
         return "question"
     if any(w in lower for w in ["कौन", "क्या", "कैसे", "कब", "कहां", "कितना", "क्यों",
                                   "કોણ", "શું", "કેવી", "ક્યારે", "ક્યાં", "કેટલા", "કેમ"]):
+        return "question"
+    # Common caller questions without explicit question words
+    _caller_questions = [
+        "is this", "are you", "tell me about",
+        "can you tell", "i want to know", "details", "more information",
+    ]
+    if any(p in lower for p in _caller_questions):
         return "question"
 
     # Negation
@@ -191,10 +249,10 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
     if any(w in lower for w in ["अलविदा", "फिर मिलते", "આવજો", "ફરી મળીશું"]):
         return "farewell"
 
-    # Greeting
-    if re.search(r"\b(hello|hi|hey|namaste|namaskar)\b", lower):
+    # Greeting — includes Gujarati/Hindi common greetings
+    if re.search(r"\b(hello|helo|hellow|hi|hey|namaste|namaskar|kem cho|kemcho|hallo|halo|bol|bolo|suno|suniye|boliye)\b", lower):
         return "greeting"
-    if any(w in lower for w in ["नमस्ते", "નમસ્તે", "હેલો"]):
+    if any(w in lower for w in ["नमस्ते", "નમસ્તે", "હેલો", "કેમ છો", "बोलो", "बोल", "सुनिए", "हेलो"]):
         return "greeting"
 
     # Gratitude
@@ -226,6 +284,8 @@ _HINDI_PATTERNS = [
     "nahi", "accha", "theek", "namaste", "dhanyavaad",
     "shukriya", "haan", "dekhna", "dikhao", "samay",
     "subah", "dopahar", "shaam", "kal", "parso", "aaj",
+    "baat", "raha", "rahi", "batao", "bolo", "boliye",
+    "kaun", "kon", "kahan", "kidhar", "suniye", "bhai",
 ]
 
 _GUJARATI_PATTERNS = [
@@ -233,6 +293,8 @@ _GUJARATI_PATTERNS = [
     "tame", "hu", "pan", "chhe", "tamne", "mane",
     "majama", "barobar", "saru", "savare", "bapore",
     "saanje", "aaje", "kaale", "joie", "joiye", "aavjo",
+    "saheb", "mari", "tari", "amne", "cho", "karo", "karo",
+    "batavo", "jao", "aavo", "bolo", "kemcho",
 ]
 
 _LANG_CLASSIFY_PROMPT = (
@@ -275,9 +337,9 @@ _OBJECTION_RESPONSES: dict[str, list[str]] = {
 # ---------------------------------------------------------------------------
 
 _FILLER_RESPONSES: dict[str, list[str]] = {
-    "en": ["Let me check the available options for you...", "One moment please..."],
-    "hi": ["एक सेकंड, मैं उपलब्ध विकल्प देखता हूँ...", "बस एक मिनट..."],
-    "gu": ["એક મિનિટ, ઉપલબ્ધ વિકલ્પો જોઈ લઉં...", "જોઈ લઉં..."],
+    "en": ["One moment...", "Sure, let me check..."],
+    "hi": ["एक सेकंड...", "बिल्कुल, बताता हूँ..."],
+    "gu": ["એક સેકન્ડ...", "બિલકુલ, જણાવું છું..."],
 }
 
 # ---------------------------------------------------------------------------
@@ -292,6 +354,38 @@ _TIMEOUT_FALLBACKS: dict[str, str] = {
 
 _RESPONSE_FALLBACK = "Sorry, could you repeat that?"
 
+# ---------------------------------------------------------------------------
+# Language switch confirmation responses
+# ---------------------------------------------------------------------------
+
+_LANG_SWITCH_RESPONSES: dict[str, str] = {
+    "hi": "जी बिल्कुल, हम हिंदी में बात करते हैं। बताइए, मैं आपकी कैसे मदद कर सकता हूँ?",
+    "en": "Sure, let's continue in English. How can I help you?",
+    "gu": "જી બિલકુલ, ચાલો ગુજરાતીમાં વાત કરીએ. બોલો, હું તમારી કેવી રીતે મદદ કરી શકું?",
+}
+
+# ---------------------------------------------------------------------------
+# Identity responses — fast deterministic answers for "who is this?"
+# ---------------------------------------------------------------------------
+
+_IDENTITY_RESPONSES: dict[str, str] = {
+    "en": (
+        "I'm calling from Pramukh Group, one of Gujarat's most trusted real estate developers. "
+        "You had shown interest in our properties and raised an inquiry. "
+        "I just wanted to have a quick chat about what you're looking for."
+    ),
+    "hi": (
+        "जी, मैं Pramukh Group से बात कर रहा हूँ, हम Gujarat के जाने-माने रियल एस्टेट डेवलपर हैं। "
+        "आपने हमारी प्रॉपर्टीज में इंटरेस्ट दिखाया था और इंक्वायरी भी की थी। "
+        "मैं बस आपसे इसके बारे में थोड़ी बात करना चाहता था।"
+    ),
+    "gu": (
+        "જી, હું Pramukh Group તરફથી બોલું છું, અમે Gujarat ના જાણીતા રિયલ એસ્ટેટ ડેવલપર છીએ. "
+        "તમે અમારી પ્રોપર્ટીઝમાં ઇન્ટરેસ્ટ દર્શાવ્યો હતો અને ઇન્ક્વાયરી પણ કરી હતી. "
+        "હું બસ આ વિશે થોડી વાત કરવા માંગતો હતો."
+    ),
+}
+
 _LANG_FALLBACKS: dict[str, str] = {
     "hi": "माफ़ कीजिए, क्या आप दोबारा बोल सकते हैं?",
     "gu": "માફ કરશો, શું તમે ફરીથી બોલી શકો?",
@@ -304,13 +398,13 @@ _LANG_FALLBACKS: dict[str, str] = {
 
 _LOCALIZED_RESPONSES: dict[str, dict[str, list[str] | str]] = {
     "hi": {
-        "greeting": ["नमस्ते! Pramukh Group से बोल रहा हूँ।", "नमस्ते! कैसे हैं आप?"],
+        "greeting": ["हेलो! Pramukh Group से बात कर रहा हूँ।", "हेलो! बोलिए, कैसे मदद कर सकता हूँ?"],
         "farewell": "अच्छा, फिर मिलते हैं! Pramukh Group से कॉल के लिए धन्यवाद।",
         "gratitude": ["आपका स्वागत है!", "खुशी हुई!"],
         "closing": "बहुत अच्छा! हम आपको डिटेल्स भेज देंगे। धन्यवाद!",
     },
     "gu": {
-        "greeting": ["નમસ્તે! Pramukh Group તરફથી બોલું છું.", "નમસ્તે! કેમ છો?"],
+        "greeting": ["હેલો! Pramukh Group તરફથી બોલું છું.", "હેલો! બોલો, કેવી રીતે મદદ કરી શકું?"],
         "farewell": "સારું, ફરી મળીશું! Pramukh Group તરફથી કૉલ માટે આભાર.",
         "gratitude": ["આપનું સ્વાગત છે!", "ખુશી થઈ!"],
         "closing": "ખૂબ સરસ! અમે તમને ડિટેલ્સ મોકલીશું. આભાર!",
@@ -340,25 +434,62 @@ _PROACTIVE_PROMPTS: dict[str, dict[str, str]] = {
 }
 
 # ---------------------------------------------------------------------------
-# Opening greeting
+# Opening greeting — bilingual so user can respond in preferred language
 # ---------------------------------------------------------------------------
 
-_OPENING_GREETING: dict[str, str] = {
+_OPENING_GREETING: str = (
+    "Hello, Namaste! मैं Pramukh Group से बात कर रहा हूँ।"
+)
+
+# ---------------------------------------------------------------------------
+# Interest line — delivered after user responds to greeting
+# ---------------------------------------------------------------------------
+
+_INTEREST_LINE: dict[str, str] = {
     "en": (
-        "Hi! ... This is calling from Pramukh Group. "
-        "You had shown interest in our properties, and I just wanted to have a quick chat about what you're looking for. "
-        "Is this a good time to talk?"
+        "You had shown interest in our properties and raised an inquiry as well. "
+        "I wanted to have a quick chat about what you're looking for."
     ),
     "hi": (
-        "नमस्ते! ... मैं Pramukh Group से बोल रहा हूँ। "
-        "आपने हमारी प्रॉपर्टीज में रुचि दिखाई थी, और मैं बस आपसे इसके बारे में थोड़ी बात करना चाहता था। "
-        "क्या अभी बात कर सकते हैं?"
+        "आपने हमारी प्रॉपर्टीज में इंटरेस्ट दिखाया था और इसके बारे में इंक्वायरी भी की थी। "
+        "मैं बस आपसे इसके बारे में थोड़ी बात करना चाहता था।"
     ),
     "gu": (
-        "નમસ્તે! ... હું Pramukh Group તરફથી બોલું છું. "
-        "તમે અમારી પ્રોપર્ટીઝમાં રસ દર્શાવ્યો હતો, અને હું બસ થોડી વાત કરવા માંગતો હતો. "
-        "શું અત્યારે વાત કરી શકીએ?"
+        "તમે અમારી પ્રોપર્ટીઝમાં ઇન્ટરેસ્ટ દર્શાવ્યો હતો અને ઇન્ક્વાયરી પણ કરી હતી. "
+        "હું બસ આ વિશે થોડી વાત કરવા માંગતો હતો."
     ),
+}
+
+# ---------------------------------------------------------------------------
+# Reconfirmation — when user denies interest the first time
+# ---------------------------------------------------------------------------
+
+_INTEREST_RECONFIRM: dict[str, str] = {
+    "en": (
+        "My apologies! We had received your profile because you had shown interest "
+        "in our property and raised an inquiry about the same. "
+        "Would you like to know more about our projects?"
+    ),
+    "hi": (
+        "माफ़ कीजिए! हमारे पास आपकी प्रोफाइल आई थी क्योंकि आपने हमारी प्रॉपर्टी में "
+        "इंटरेस्ट दिखाया था और इसके बारे में इंक्वायरी भी की थी। "
+        "क्या आप हमारे प्रोजेक्ट्स के बारे में जानना चाहेंगे?"
+    ),
+    "gu": (
+        "માફ કરજો! અમારી પાસે તમારી પ્રોફાઇલ આવી હતી કારણ કે તમે અમારી પ્રોપર્ટીમાં "
+        "ઇન્ટરેસ્ટ દર્શાવ્યો હતો અને ઇન્ક્વાયરી પણ કરી હતી. "
+        "શું તમે અમારા પ્રોજેક્ટ્સ વિશે જાણવા માંગો છો?"
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# Graceful close — when user declines twice
+# ---------------------------------------------------------------------------
+
+_GRACEFUL_CLOSE: dict[str, str] = {
+    "en": "Thank you so much for your time! Have a great day.",
+    "hi": "आपके समय के लिए बहुत बहुत धन्यवाद! आपका दिन शुभ हो।",
+    "gu": "તમારા સમય માટે ખૂબ ખૂબ આભાર! તમારો દિવસ શુભ રહે.",
 }
 
 
@@ -393,11 +524,14 @@ class ConversationRouter:
     """
     Proactive outbound calling agent for Pramukh Group.
 
-    Drives the conversation through: GREETING -> LOCATION -> PROPERTY_TYPE
-    -> SCHEDULING -> CONFIRMATION -> CLOSING.
+    Drives the conversation through:
+      GREETING -> INTEREST_CONFIRM -> (INTEREST_RECONFIRM) -> LOCATION
+      -> PROPERTY_TYPE -> SCHEDULING -> CONFIRMATION -> CLOSING.
 
-    Extracts structured booking data at each stage. Falls back to LLM for
-    natural responses and question handling.
+    Agent speaks first with a bilingual greeting. User's language is
+    detected from their first response and mirrored throughout.
+    Extracts structured booking data at each stage. Falls back to LLM
+    for natural responses and question handling.
     """
 
     def __init__(
@@ -405,7 +539,7 @@ class ConversationRouter:
         api_key: str | None = None,
         model: str = "gpt-4o-mini",
         timeout: float = LLM_TIMEOUT,
-        default_language: str = "en",
+        default_language: str = "hi",
     ) -> None:
         self._api_key = api_key or os.environ.get("OPENAI_API_KEY", "")
         self._model = model
@@ -437,12 +571,12 @@ class ConversationRouter:
     # ------------------------------------------------------------------
 
     async def generate_opening(self) -> EngineResult:
-        """Generate the proactive opening greeting. Called once at pipeline start."""
-        lang = self.state.language
-        greeting = _OPENING_GREETING.get(lang, _OPENING_GREETING["en"])
+        """Generate the bilingual opening greeting. Called once at pipeline start.
+        Agent speaks first — bilingual so user responds in their preferred language."""
+        greeting = _OPENING_GREETING
         self.memory.add_assistant(greeting)
         self.state.stage = STAGE_GREETING
-        logger.info("[OPENING] Generated greeting, staying at GREETING stage")
+        logger.info("[OPENING] Bilingual greeting delivered, waiting for user response")
         return EngineResult(text=greeting, is_shortcut=True, intent="greeting")
 
     # ------------------------------------------------------------------
@@ -486,18 +620,15 @@ class ConversationRouter:
             self.state.language if self.state.language in candidates else candidates[0]
         )
 
-        # High-confidence detection (script/pattern) overrides stabilization
-        # so the response always matches the language the user just spoke.
-        # Low-confidence detection (pure ASCII "default") preserves the
-        # CURRENT language to maintain consistency (e.g. "yes" keeps Hindi
-        # if the conversation has been in Hindi).
+        # High-confidence detection (script/pattern) overrides — response
+        # matches the language the user just spoke. Ambiguous inputs (ASCII
+        # "default") preserve the current language so "yes", "hello" etc.
+        # don't flip the conversation away from Hindi/Gujarati.
         prev_lang = self.state.language
         if src in ("script", "pattern") and conf >= 0.7:
             self.state.language = detected_lang
-        elif src == "default" and prev_lang != "en":
-            self.state.language = prev_lang
         else:
-            self.state.language = stabilized_lang
+            self.state.language = prev_lang
 
         self.state.lang_confidence = conf
         self.state.lang_source = src
@@ -560,37 +691,40 @@ class ConversationRouter:
             yield EngineResult(text=resp, is_shortcut=True, intent="gratitude")
             return
 
+        # --- Identity question at any stage — fast deterministic response ---
+        if intent == "identity_question":
+            _cancel_llm()
+            lang = self.state.language
+            resp = _IDENTITY_RESPONSES.get(lang, _IDENTITY_RESPONSES["hi"])
+            self.memory.add_assistant(resp)
+            if self.state.stage == STAGE_GREETING:
+                self.state.stage = STAGE_INTEREST_CONFIRM
+            elif self.state.stage == STAGE_INTEREST_CONFIRM:
+                self.state.stage = STAGE_LOCATION
+            yield EngineResult(text=resp, is_shortcut=True, intent="identity_question")
+            return
+
+        # --- Language switch at any stage ---
+        if intent == "language_switch":
+            _cancel_llm()
+            new_lang = self._extract_requested_language(text)
+            self.state.language = new_lang
+            self.state.language_history = [new_lang] * 5
+            resp = _LANG_SWITCH_RESPONSES.get(new_lang, _LANG_SWITCH_RESPONSES["hi"])
+            self.memory.add_assistant(resp)
+            yield EngineResult(text=resp, is_shortcut=True, intent="language_switch")
+            return
+
         # =============================================================
-        # GREETING STAGE — user speaks first, we respond accordingly
+        # GREETING STAGE — agent already said bilingual "Hello, Namaste!
+        # Mai Pramukh Group se baat kar raha hu." Now we detect the
+        # user's language from their response and deliver the interest line.
         # =============================================================
         if self.state.stage == STAGE_GREETING:
-            _cancel_llm()
 
-            # User opens with a greeting → respond with our opening + ask location
-            if intent == "greeting" or intent == "affirmation":
-                lang = self.state.language
-                greeting = _OPENING_GREETING.get(lang, _OPENING_GREETING["en"])
-                self.memory.add_assistant(greeting)
-                self.state.stage = STAGE_LOCATION
-                yield EngineResult(text=greeting, is_shortcut=True, intent="greeting")
-                return
-
-            if intent == "negation" or intent == "objection":
-                lang = self.state.language
-                if lang == "hi":
-                    resp = "कोई बात नहीं! कब बात करना सही रहेगा?"
-                elif lang == "gu":
-                    resp = "કોઈ વાત નહીં! ક્યારે વાત કરવી યોગ્ય રહેશે?"
-                else:
-                    resp = "No problem at all! When would be a better time to talk?"
-                self.memory.add_assistant(resp)
-                self.state.stage = STAGE_CLOSING
-                yield EngineResult(text=resp, is_shortcut=True, intent="reschedule")
-                return
-
-            # User starts with a direct intent (location, property, etc.)
-            # Skip greeting entirely — advance to the right stage and process
+            # User starts with a direct intent — skip to the right stage
             if intent == "location_selection":
+                _cancel_llm()
                 location = self._extract_location(text)
                 if location:
                     self.memory.booking.location = location
@@ -602,6 +736,7 @@ class ConversationRouter:
                     return
 
             if intent == "property_type":
+                _cancel_llm()
                 bhk = self._extract_bhk(text)
                 if bhk:
                     self.memory.booking.property_type = bhk.upper()
@@ -612,12 +747,134 @@ class ConversationRouter:
                     yield EngineResult(text=resp, is_shortcut=True, intent="property_type")
                     return
 
-            # Any other input at greeting — respond with opening and move on
+            # For all other responses (hello, haan, who is this, question,
+            # general, etc.) — user's language is now detected. Deliver the
+            # interest line in their language and wait for yes/no.
+            _cancel_llm()
             lang = self.state.language
-            greeting = _OPENING_GREETING.get(lang, _OPENING_GREETING["en"])
-            self.memory.add_assistant(greeting)
+            interest = _INTEREST_LINE.get(lang, _INTEREST_LINE["hi"])
+            self.memory.add_assistant(interest)
+            self.state.stage = STAGE_INTEREST_CONFIRM
+            yield EngineResult(text=interest, is_shortcut=True, intent="interest_line")
+            return
+
+        # =============================================================
+        # INTEREST CONFIRM — user responds yes/no to the interest line
+        # =============================================================
+        if self.state.stage == STAGE_INTEREST_CONFIRM:
+
+            # YES / affirmation / greeting / question — user is engaged, advance
+            if intent in ("affirmation", "greeting", "question", "general",
+                          "location_selection", "property_type", "time_preference"):
+                _cancel_llm()
+
+                # If they gave a direct data intent, handle it immediately
+                if intent == "location_selection":
+                    location = self._extract_location(text)
+                    if location:
+                        self.memory.booking.location = location
+                        self.state.stage = STAGE_PROPERTY_TYPE
+                        next_prompt = self._get_proactive_prompt(STAGE_PROPERTY_TYPE)
+                        resp = self._location_ack(location) + " " + next_prompt
+                        self.memory.add_assistant(resp)
+                        yield EngineResult(text=resp, is_shortcut=True, intent="location_selection")
+                        return
+
+                if intent == "property_type":
+                    bhk = self._extract_bhk(text)
+                    if bhk:
+                        self.memory.booking.property_type = bhk.upper()
+                        self.state.stage = STAGE_LOCATION
+                        next_prompt = self._get_proactive_prompt(STAGE_LOCATION)
+                        resp = self._bhk_ack(bhk, "your area") + " " + next_prompt
+                        self.memory.add_assistant(resp)
+                        yield EngineResult(text=resp, is_shortcut=True, intent="property_type")
+                        return
+
+                # Otherwise advance to LOCATION with the proactive prompt
+                lang = self.state.language
+                resp = self._get_proactive_prompt(STAGE_LOCATION)
+                self.memory.add_assistant(resp)
+                self.state.stage = STAGE_LOCATION
+                yield EngineResult(text=resp, is_shortcut=True, intent="interest_confirmed")
+                return
+
+            # NO / negation / objection — politely reconfirm
+            if intent in ("negation", "objection"):
+                _cancel_llm()
+                lang = self.state.language
+                resp = _INTEREST_RECONFIRM.get(lang, _INTEREST_RECONFIRM["hi"])
+                self.memory.add_assistant(resp)
+                self.state.stage = STAGE_INTEREST_RECONFIRM
+                yield EngineResult(text=resp, is_shortcut=True, intent="interest_reconfirm")
+                return
+
+            # Anything else — treat as engagement, advance to LOCATION
+            _cancel_llm()
+            lang = self.state.language
+            resp = self._get_proactive_prompt(STAGE_LOCATION)
+            self.memory.add_assistant(resp)
             self.state.stage = STAGE_LOCATION
-            yield EngineResult(text=greeting, is_shortcut=True, intent="greeting")
+            yield EngineResult(text=resp, is_shortcut=True, intent="interest_confirmed")
+            return
+
+        # =============================================================
+        # INTEREST RECONFIRM — second chance after first denial
+        # =============================================================
+        if self.state.stage == STAGE_INTEREST_RECONFIRM:
+
+            # YES — user changed their mind, proceed to location
+            if intent in ("affirmation", "greeting", "question", "general",
+                          "location_selection", "property_type"):
+                _cancel_llm()
+
+                if intent == "location_selection":
+                    location = self._extract_location(text)
+                    if location:
+                        self.memory.booking.location = location
+                        self.state.stage = STAGE_PROPERTY_TYPE
+                        next_prompt = self._get_proactive_prompt(STAGE_PROPERTY_TYPE)
+                        resp = self._location_ack(location) + " " + next_prompt
+                        self.memory.add_assistant(resp)
+                        yield EngineResult(text=resp, is_shortcut=True, intent="location_selection")
+                        return
+
+                if intent == "property_type":
+                    bhk = self._extract_bhk(text)
+                    if bhk:
+                        self.memory.booking.property_type = bhk.upper()
+                        self.state.stage = STAGE_LOCATION
+                        next_prompt = self._get_proactive_prompt(STAGE_LOCATION)
+                        resp = self._bhk_ack(bhk, "your area") + " " + next_prompt
+                        self.memory.add_assistant(resp)
+                        yield EngineResult(text=resp, is_shortcut=True, intent="property_type")
+                        return
+
+                lang = self.state.language
+                resp = self._get_proactive_prompt(STAGE_LOCATION)
+                self.memory.add_assistant(resp)
+                self.state.stage = STAGE_LOCATION
+                yield EngineResult(text=resp, is_shortcut=True, intent="interest_confirmed")
+                return
+
+            # NO again — gracefully close
+            if intent in ("negation", "objection"):
+                _cancel_llm()
+                lang = self.state.language
+                resp = _GRACEFUL_CLOSE.get(lang, _GRACEFUL_CLOSE["hi"])
+                self.memory.add_assistant(resp)
+                self.state.stage = STAGE_CLOSING
+                self.state.is_closing = True
+                yield EngineResult(text=resp, is_shortcut=True, intent="graceful_close")
+                return
+
+            # Anything else — give benefit of doubt, proceed to location
+            _cancel_llm()
+            lang = self.state.language
+            resp = self._get_proactive_prompt(STAGE_LOCATION)
+            self.memory.add_assistant(resp)
+            self.state.stage = STAGE_LOCATION
+            yield EngineResult(text=resp, is_shortcut=True, intent="interest_confirmed")
             return
 
         # =============================================================
@@ -652,6 +909,15 @@ class ConversationRouter:
                 yield EngineResult(text=resp, is_shortcut=True, intent="affirmation")
                 return
 
+            # Question or general conversation — answer via LLM, then nudge back
+            if intent in ("question", "general"):
+                self.state.llm_cancelled = False
+                async for result in self._consume_llm_with_filler(
+                    llm_queue, llm_done, intent, nudge_back=True,
+                ):
+                    yield result
+                return
+
         # =============================================================
         # PROPERTY TYPE STAGE
         # =============================================================
@@ -678,6 +944,15 @@ class ConversationRouter:
                 resp = self._get_proactive_prompt(STAGE_PROPERTY_TYPE)
                 self.memory.add_assistant(resp)
                 yield EngineResult(text=resp, is_shortcut=True, intent="location_update")
+                return
+
+            # Question or general conversation — answer via LLM, then nudge back
+            if intent in ("question", "general"):
+                self.state.llm_cancelled = False
+                async for result in self._consume_llm_with_filler(
+                    llm_queue, llm_done, intent, nudge_back=True,
+                ):
+                    yield result
                 return
 
         # =============================================================
@@ -711,6 +986,15 @@ class ConversationRouter:
                 yield EngineResult(text=resp, is_shortcut=True, intent="property_update")
                 return
 
+            # Question or general conversation — answer via LLM, then nudge back
+            if intent in ("question", "general"):
+                self.state.llm_cancelled = False
+                async for result in self._consume_llm_with_filler(
+                    llm_queue, llm_done, intent, nudge_back=True,
+                ):
+                    yield result
+                return
+
         # =============================================================
         # CONFIRMATION STAGE
         # =============================================================
@@ -732,11 +1016,20 @@ class ConversationRouter:
                 if lang == "hi":
                     resp = "कोई बात नहीं। कौन सा समय आपके लिए बेहतर होगा?"
                 elif lang == "gu":
-                    resp = "કોઈ વાત નહીં. કયો સમય તમારા માટે વધુ સારો હશે?"
+                    resp = "કોઈ વાત નહીं. કયો સમય તમારા માટે વધુ સારો હશે?"
                 else:
                     resp = "No problem. Which time would work better for you?"
                 self.memory.add_assistant(resp)
                 yield EngineResult(text=resp, is_shortcut=True, intent="reschedule")
+                return
+
+            # Question or general conversation — answer via LLM, then nudge back
+            if intent in ("question", "general"):
+                self.state.llm_cancelled = False
+                async for result in self._consume_llm_with_filler(
+                    llm_queue, llm_done, intent, nudge_back=True,
+                ):
+                    yield result
                 return
 
         # =============================================================
@@ -1093,9 +1386,9 @@ class ConversationRouter:
         )
 
         parts = [
-            "You are a friendly calling assistant from Pramukh Group, a trusted real estate developer in Gujarat, India.",
+            "You are a proactive sales calling assistant from Pramukh Group, a trusted real estate developer in Gujarat, India.",
             "You are making an outbound call to someone who showed interest in Pramukh properties.",
-            "Your goal is to help them find their perfect property and schedule a site visit.",
+            "Your PRIMARY GOAL is to SELL — generate excitement about properties and schedule a site visit.",
             "",
             f"CURRENT BOOKING STATE:",
             f"- Stage: {self.state.stage}",
@@ -1103,33 +1396,61 @@ class ConversationRouter:
             f"- Property type: {b.property_type or 'not selected yet'}",
             f"- Appointment: {b.appointment_time or 'not scheduled yet'}",
             "",
-            "LOCATIONS: Surat, Vapi, Silvassa (Gujarat, India)",
-            "PROPERTY TYPES: 2 BHK, 3 BHK, 4 BHK, 5 BHK",
+            "LOCATIONS & KEY SELLING POINTS:",
+            "- Surat: Gujarat's diamond city, booming IT hub, excellent infrastructure, 2-5 BHK from ₹35L-₹1.5Cr",
+            "- Vapi: Industrial growth corridor, close to Mumbai, affordable luxury, 2-4 BHK from ₹25L-₹85L",
+            "- Silvassa: Peaceful green living near Vapi, nature surroundings, weekend home destination, 2-3 BHK from ₹20L-₹60L",
+            "PROPERTY TYPES: 2 BHK, 3 BHK, 4 BHK, 5 BHK — all with modern amenities, parking, garden, security",
+            "",
+            "YOUR IDENTITY:",
+            "- You are calling on behalf of Pramukh Group, a well-known real estate developer in Gujarat.",
+            "- If asked 'who is this?', introduce yourself and immediately pivot to why you're calling.",
+            "- Your name is not important — you represent Pramukh Group.",
+            "",
+            "SALES APPROACH:",
+            "- Be PROACTIVE — don't wait for questions, volunteer useful information about properties.",
+            "- When the user mentions a location, immediately highlight what makes it special and what options are available.",
+            "- When the user mentions BHK, share price range and key amenities to build excitement.",
+            "- Always guide toward scheduling a site visit — 'seeing is believing' is your close.",
+            "- If the user hesitates, share a compelling detail (new launch, limited units, special pricing).",
+            "- Answer every question thoroughly — a well-informed buyer is more likely to visit.",
             "",
             "CRITICAL RULES:",
-            "- YOU lead the conversation. Be proactive. Always guide toward the next step.",
-            "- Respond in 1-2 sentences MAXIMUM. You are on a phone call.",
-            "- Sound natural: use contractions, be warm and conversational.",
-            "- If the user asks a question you can answer (about Pramukh properties, locations, BHK options), answer briefly and return to the booking flow.",
-            '- If you CANNOT answer a question, say "I\'ll have our team get back to you on that" and continue the flow.',
+            "- YOU lead the conversation. Answer questions AND proactively share property details.",
+            "- Respond in 2-3 sentences. You are on a phone call — be informative but concise.",
+            "- Sound natural: be warm, enthusiastic, and conversational.",
+            '- If you CANNOT answer a specific question, say "main apni team se confirm karke batata hu" and continue the flow.',
             "- No bullet points, lists, markdown, or emojis.",
             "- Be polite, respectful, and proactive. Respect the user's time.",
             "- Use formal address (aap/tamne) in Hindi/Gujarati.",
+            "- NEVER lose sight of the goal: get them excited about properties and book a site visit.",
         ]
+
+        parts.append(
+            "\nLANGUAGE MIRRORING (MANDATORY):"
+            "\n- You MUST respond in the SAME language the user is speaking."
+            "\n- If the user switches language mid-conversation, switch immediately to match them."
+            "\n- Never insist on a language the user has moved away from."
+        )
 
         if self.state.language == "hi":
             parts.append(
-                "\nLANGUAGE RULE (MANDATORY): The user is speaking Hindi. "
-                "You MUST respond ENTIRELY in Hindi (Devanagari script or transliterated Hindi). "
+                "\nCURRENT LANGUAGE: Hindi. "
+                "Respond ENTIRELY in Hindi (Devanagari script or transliterated Hindi). "
                 "Do NOT mix English words into your response. Do NOT respond in English. "
                 "Use natural Hindi as spoken in Gujarat/India."
             )
         elif self.state.language == "gu":
             parts.append(
-                "\nLANGUAGE RULE (MANDATORY): The user is speaking Gujarati. "
-                "You MUST respond ENTIRELY in Gujarati (Gujarati script or transliterated Gujarati). "
+                "\nCURRENT LANGUAGE: Gujarati. "
+                "Respond ENTIRELY in Gujarati (Gujarati script or transliterated Gujarati). "
                 "Do NOT mix English or Hindi into your response. Do NOT respond in English. "
                 "Use natural Gujarati as spoken in Gujarat."
+            )
+        else:
+            parts.append(
+                "\nCURRENT LANGUAGE: English. "
+                "Respond in clear, conversational English."
             )
 
         context_str = self.memory.context.to_prompt_string()
@@ -1164,7 +1485,7 @@ class ConversationRouter:
                 lang = "hi" if hi_score >= gu_score else "gu"
                 result = (lang, max(confidence, 0.5), "pattern")
             elif text_lower.isascii():
-                result = ("en", 1.0, "default")
+                result = ("hi", 0.5, "default")
             else:
                 lang = await self._classify_language_llm(text_lower)
                 result = (lang, 0.9, "llm")
@@ -1193,6 +1514,16 @@ class ConversationRouter:
     # ------------------------------------------------------------------
     # Objection + filler helpers
     # ------------------------------------------------------------------
+
+    def _extract_requested_language(self, text: str) -> str:
+        lower = text.lower()
+        if any(w in lower for w in ["hindi", "हिंदी", "हिन्दी", "હિન્દી"]):
+            return "hi"
+        if any(w in lower for w in ["gujarati", "ગુજરાતી", "गुजराती"]):
+            return "gu"
+        if any(w in lower for w in ["english", "अंग्रेज़ी", "अंग्रेजी", "અંગ્રેજી", "angrezi"]):
+            return "en"
+        return self.state.language
 
     def _pick_objection_response(self) -> str:
         lang = self.state.language
