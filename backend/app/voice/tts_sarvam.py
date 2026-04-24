@@ -67,6 +67,7 @@ class SarvamTTS(StreamingTTS):
         self._output_device = output_device
         self._playback_finished = threading.Event()
         self._audio_q: _queue.Queue | None = None
+        self._playback_thread: threading.Thread | None = None
 
         if not self._api_key:
             logger.warning("[TTS:Sarvam] SARVAMAI_API_KEY not set — calls will fail")
@@ -82,6 +83,8 @@ class SarvamTTS(StreamingTTS):
         return self._client
 
     async def speak(self, text: str) -> None:
+        # Ensure any previous playback is fully stopped
+        await self._cleanup_playback()
         self._reset()
         self._playing = True
 
@@ -119,8 +122,8 @@ class SarvamTTS(StreamingTTS):
             finally:
                 loop.call_soon_threadsafe(self._playback_finished.set)
 
-        thread = threading.Thread(target=_play_streaming, daemon=True)
-        thread.start()
+        self._playback_thread = threading.Thread(target=_play_streaming, daemon=True)
+        self._playback_thread.start()
 
         try:
             async for chunk in self._stream_audio(text):
@@ -129,7 +132,11 @@ class SarvamTTS(StreamingTTS):
                     break
                 samples = np.frombuffer(chunk.audio, dtype=np.int16)
                 audio_float = samples.astype(np.float32) / 32768.0
-                await loop.run_in_executor(None, self._audio_q.put, audio_float)
+                try:
+                    self._audio_q.put(audio_float, timeout=1.0)
+                except _queue.Full:
+                    logger.warning("[TTS:Sarvam] Audio queue full — dropping chunk")
+                    continue
                 chunk_count += 1
                 if chunk_count == 1:
                     logger.info("[TTS:Sarvam] First chunk sent to playback")
@@ -138,12 +145,20 @@ class SarvamTTS(StreamingTTS):
             logger.exception("[TTS:Sarvam] speak() failed")
         finally:
             if self._audio_q:
-                self._audio_q.put(None)
+                try:
+                    self._audio_q.put(None, timeout=0.5)
+                except _queue.Full:
+                    pass
 
+            deadline = asyncio.get_event_loop().time() + 5.0
             while not self._playback_finished.is_set():
                 if self._cancelled:
                     sd.stop()
                     logger.info("[TTS:Sarvam] Playback stopped by cancellation")
+                    break
+                if asyncio.get_event_loop().time() > deadline:
+                    logger.warning("[TTS:Sarvam] Playback thread timed out — forcing stop")
+                    sd.stop()
                     break
                 await asyncio.sleep(0.05)
 
@@ -152,9 +167,30 @@ class SarvamTTS(StreamingTTS):
                 logger.info("[TTS:Sarvam] Playback complete (%d chunks)", chunk_count)
             self._reset()
 
+    async def _cleanup_playback(self) -> None:
+        """Ensure previous playback thread is fully stopped."""
+        if self._playback_thread and self._playback_thread.is_alive():
+            if self._audio_q:
+                while not self._audio_q.empty():
+                    try:
+                        self._audio_q.get_nowait()
+                    except _queue.Empty:
+                        break
+                try:
+                    self._audio_q.put_nowait(None)
+                except _queue.Full:
+                    pass
+            try:
+                sd.stop()
+            except Exception:
+                pass
+            self._playback_thread.join(timeout=2.0)
+            if self._playback_thread.is_alive():
+                logger.warning("[TTS:Sarvam] Previous playback thread did not stop")
+        self._playback_thread = None
+
     async def _stream_audio(self, text: str):
         lang_code = _LANG_CODE_MAP.get(self._language, "en-IN")
-        client = self._get_client()
 
         payload = {
             "text": text,
@@ -166,42 +202,60 @@ class SarvamTTS(StreamingTTS):
             "output_audio_codec": "linear16",
         }
 
-        try:
-            async with client.stream(
-                "POST",
-                SARVAM_TTS_STREAM_URL,
-                headers={
-                    "api-subscription-key": self._api_key,
-                    "Content-Type": "application/json",
-                },
-                json=payload,
-            ) as response:
-                if response.status_code != 200:
-                    body = await response.aread()
-                    logger.error(
-                        "[TTS:Sarvam] HTTP %d — %s",
-                        response.status_code, body[:500],
-                    )
+        max_retries = 2
+        for attempt in range(max_retries):
+            if self._cancelled:
+                return
+
+            client = self._get_client()
+            try:
+                async with client.stream(
+                    "POST",
+                    SARVAM_TTS_STREAM_URL,
+                    headers={
+                        "api-subscription-key": self._api_key,
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                ) as response:
+                    if response.status_code != 200:
+                        body = await response.aread()
+                        logger.error(
+                            "[TTS:Sarvam] HTTP %d — %s",
+                            response.status_code, body[:500],
+                        )
+                        return
+
+                    logger.info("[TTS:Sarvam] Streaming started for %r (%s, %s)",
+                                text[:50], lang_code, self._speaker)
+
+                    async for raw_chunk in response.aiter_bytes(CHUNK_READ_SIZE):
+                        if self._cancelled:
+                            return
+                        yield TTSChunk(
+                            audio=raw_chunk,
+                            text_segment=text,
+                            is_last=False,
+                        )
+
+                    logger.info("[TTS:Sarvam] Stream complete")
                     return
 
-                logger.info("[TTS:Sarvam] Streaming started for %r (%s, %s)",
-                            text[:50], lang_code, self._speaker)
+            except httpx.TimeoutException:
+                logger.warning("[TTS:Sarvam] Stream timeout (attempt %d/%d) for %r",
+                               attempt + 1, max_retries, text[:50])
+            except (httpx.RemoteProtocolError, httpx.ReadError) as exc:
+                logger.warning("[TTS:Sarvam] Stream disconnected (attempt %d/%d): %s",
+                               attempt + 1, max_retries, exc)
+                # Force new client on reconnect
+                self._client = None
+            except Exception:
+                logger.exception("[TTS:Sarvam] Stream error (attempt %d/%d)",
+                                 attempt + 1, max_retries)
+                break
 
-                async for raw_chunk in response.aiter_bytes(CHUNK_READ_SIZE):
-                    if self._cancelled:
-                        break
-                    yield TTSChunk(
-                        audio=raw_chunk,
-                        text_segment=text,
-                        is_last=False,
-                    )
-
-                logger.info("[TTS:Sarvam] Stream complete")
-
-        except httpx.TimeoutException:
-            logger.warning("[TTS:Sarvam] Stream timeout for %r", text[:50])
-        except Exception:
-            logger.exception("[TTS:Sarvam] Stream error")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(0.2)
 
     async def stop(self) -> None:
         await super().stop()
@@ -214,6 +268,7 @@ class SarvamTTS(StreamingTTS):
             sd.stop()
         except Exception:
             pass
+        await self._cleanup_playback()
 
     async def close(self) -> None:
         if self._client:

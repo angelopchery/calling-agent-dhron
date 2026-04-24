@@ -93,6 +93,8 @@ class ConversationState:
         self.llm_cancelled: bool = False
         self.parallel_execution: bool = False
         self.objection_handled: bool = False
+        self.language_locked: bool = False
+        self.language_lock_turns: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -153,7 +155,8 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
                                   "રસ નથી", "વ્યસ્ત", "જરૂર નથી"]):
         return "objection"
 
-    # Language switch request — "hindi me baat karo", "can you speak english", etc.
+    # Language switch request — highest priority after objection.
+    # Catches romanized, Devanagari, and Gujarati script requests.
     _lang_switch_phrases = [
         "hindi me", "hindi mai", "hindi mein", "hindi boliye", "hindi bolo",
         "hindi me baat", "hindi mai baat", "hindi mein baat",
@@ -165,13 +168,32 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
         "talk in hindi", "talk in english", "talk in gujarati",
         "speak in hindi", "speak in english", "speak in gujarati",
         "switch to hindi", "switch to english", "switch to gujarati",
+        "in english", "in hindi", "in gujarati",
     ]
     if any(p in lower for p in _lang_switch_phrases):
         return "language_switch"
-    if any(w in lower for w in [
-        "हिंदी में", "अंग्रेज़ी में", "अंग्रेजी में",
+    # Devanagari script — all spellings of language names + में/बोलो/बात
+    _lang_switch_devanagari = [
+        "हिंदी में", "हिन्दी में", "हिंदी बोल", "हिन्दी बोल",
+        "हिंदी में बात", "हिन्दी में बात",
+        "अंग्रेज़ी में", "अंग्रेजी में", "इंग्लिश में",
+        "अंग्रेज़ी बोल", "अंग्रेजी बोल", "इंग्लिश बोल",
+        "अंग्रेज़ी में बात", "अंग्रेजी में बात", "इंग्लिश में बात",
+        "गुजराती में", "गुजराती बोल", "गुजराती में बात",
+    ]
+    if any(p in text for p in _lang_switch_devanagari):
+        return "language_switch"
+    # Gujarati script
+    if any(w in text for w in [
         "ગુજરાતીમાં", "અંગ્રેજીમાં", "હિન્દીમાં",
+        "ઇંગ્લિશમાં", "ગુજરાતી બોલ", "અંગ્રેજી બોલ",
+        "હિન્દી બોલ", "ઇંગ્લિશ બોલ",
     ]):
+        return "language_switch"
+    # Catch-all: any mention of a language name with "baat/bol/bolo" nearby
+    if re.search(r"(?:english|hindi|gujarati|इंग्लिश|अंग्रेज़ी|अंग्रेजी|हिंदी|हिन्दी|गुजराती|ગુજરાતી|અંગ્રેજી|હિન્દી|ઇંગ્લિશ).{0,15}(?:बात|बोल|bol|baat|bolo|boliye|વાત|બોલ)", lower):
+        return "language_switch"
+    if re.search(r"(?:बात|बोल|bol|baat|bolo|boliye|વાત|બોલ).{0,15}(?:english|hindi|gujarati|इंग्लिश|अंग्रेज़ी|अंग्रेजी|हिंदी|हिन्दी|गुजराती|ગુજરાતી|અંગ્રેજી|હિન્દી|ઇંગ્લિશ)", lower):
         return "language_switch"
 
     # Location selection
@@ -289,12 +311,19 @@ _HINDI_PATTERNS = [
 ]
 
 _GUJARATI_PATTERNS = [
-    "che", "chu", "hatu", "hase", "shu", "kem",
-    "tame", "hu", "pan", "chhe", "tamne", "mane",
-    "majama", "barobar", "saru", "savare", "bapore",
-    "saanje", "aaje", "kaale", "joie", "joiye", "aavjo",
-    "saheb", "mari", "tari", "amne", "cho", "karo", "karo",
-    "batavo", "jao", "aavo", "bolo", "kemcho",
+    "che", "chu", "chhe", "cho", "chho", "chie", "chiye",
+    "hatu", "hase", "hati", "hoy",
+    "shu", "kem", "kemcho", "kem cho",
+    "tame", "hu", "pan", "tamne", "mane", "amne", "amara", "tamara",
+    "majama", "barobar", "saru", "sarun",
+    "savare", "bapore", "saanje", "aaje", "kaale",
+    "joie", "joiye", "jova", "joi", "jovun",
+    "aavjo", "aavo", "jao",
+    "saheb", "mari", "tari",
+    "batavo", "janavo", "bolo",
+    "karo", "karso", "kariye",
+    "atyare", "pachhi", "pela",
+    "nathi", "nahi", "haji",
 ]
 
 _LANG_CLASSIFY_PROMPT = (
@@ -492,6 +521,16 @@ _GRACEFUL_CLOSE: dict[str, str] = {
     "gu": "તમારા સમય માટે ખૂબ ખૂબ આભાર! તમારો દિવસ શુભ રહે.",
 }
 
+# ---------------------------------------------------------------------------
+# Location ask — short question after interest is confirmed
+# ---------------------------------------------------------------------------
+
+_LOCATION_ASK: dict[str, str] = {
+    "en": "Great! Which location are you interested in?",
+    "hi": "बढ़िया! आप किस लोकेशन में देखना चाहेंगे?",
+    "gu": "સરસ! તમે કઈ લોકેશનમાં જોવા માંગો છો?",
+}
+
 
 # ---------------------------------------------------------------------------
 # Response validation
@@ -605,35 +644,47 @@ class ConversationRouter:
         # --- Language detection + stabilization ---
         detected_lang, conf, src = await self.detect_language_v3(text)
         self.state.turn_count += 1
-        logger.info('[LANG] "%s" -> %s (src=%s, conf=%.2f)', text, detected_lang, src, conf)
+        logger.info('[LANG] "%s" -> %s (src=%s, conf=%.2f, locked=%s)',
+                     text, detected_lang, src, conf, self.state.language_locked)
 
         self.state.language_history.append(detected_lang)
         history = self.state.language_history[-5:]
         self.state.language_history = history
 
-        counts: dict[str, int] = {}
-        for h in history:
-            counts[h] = counts.get(h, 0) + 1
-        max_count = max(counts.values())
-        candidates = [l for l, c in counts.items() if c == max_count]
-        stabilized_lang = candidates[0] if len(candidates) == 1 else (
-            self.state.language if self.state.language in candidates else candidates[0]
+        prev_lang = self.state.language
+
+        is_gujarati_detected = (
+            detected_lang == "gu"
+            or src == "script_gu_markers"
         )
 
-        # High-confidence detection (script/pattern) overrides — response
-        # matches the language the user just spoke. Ambiguous inputs (ASCII
-        # "default") preserve the current language so "yes", "hello" etc.
-        # don't flip the conversation away from Hindi/Gujarati.
-        prev_lang = self.state.language
-        if src in ("script", "pattern") and conf >= 0.7:
+        # Decay the lock after 3 turns — allows natural switching back
+        if self.state.language_locked:
+            self.state.language_lock_turns += 1
+            if self.state.language_lock_turns > 3:
+                self.state.language_locked = False
+                logger.info("[LANG] Lock expired after %d turns", self.state.language_lock_turns)
+
+        # Gujarati script or markers always override — unambiguous
+        if is_gujarati_detected:
+            if self.state.language != "gu":
+                logger.info("[LANG] Switching to Gujarati (src=%s)", src)
+            self.state.language = "gu"
+        elif src == "pattern" and conf >= 0.7:
+            # Pattern-based detection: Hindi/Gujarati romanized words
             self.state.language = detected_lang
-        else:
-            self.state.language = prev_lang
+        elif src == "script" and detected_lang == "hi":
+            # Devanagari text — could be Hindi OR Gujarati via STT.
+            # Only switch to Hindi if not currently Gujarati, or if
+            # language is not locked.
+            if prev_lang != "gu" or not self.state.language_locked:
+                self.state.language = "hi"
+        # Ambiguous/default: preserve current language
 
         self.state.lang_confidence = conf
         self.state.lang_source = src
-        logger.info('[LANG] Response language: %s (detected=%s, stabilized=%s)',
-                     self.state.language, detected_lang, stabilized_lang)
+        logger.info('[LANG] Response language: %s (detected=%s, prev=%s)',
+                     self.state.language, detected_lang, prev_lang)
 
         # Reset per-turn metrics
         self.state.filler_used = False
@@ -709,6 +760,7 @@ class ConversationRouter:
             _cancel_llm()
             new_lang = self._extract_requested_language(text)
             self.state.language = new_lang
+            self.state.language_locked = True
             self.state.language_history = [new_lang] * 5
             resp = _LANG_SWITCH_RESPONSES.get(new_lang, _LANG_SWITCH_RESPONSES["hi"])
             self.memory.add_assistant(resp)
@@ -748,9 +800,14 @@ class ConversationRouter:
                     return
 
             # For all other responses (hello, haan, who is this, question,
-            # general, etc.) — user's language is now detected. Deliver the
-            # interest line in their language and wait for yes/no.
+            # general, etc.) — user's language is now detected from their
+            # first response to the bilingual greeting. Lock it so STT
+            # Devanagari output doesn't flip it back.
             _cancel_llm()
+            if not self.state.language_locked:
+                self.state.language_locked = True
+                logger.info("[LANG] Locked language to %s from greeting response",
+                            self.state.language)
             lang = self.state.language
             interest = _INTEREST_LINE.get(lang, _INTEREST_LINE["hi"])
             self.memory.add_assistant(interest)
@@ -763,40 +820,48 @@ class ConversationRouter:
         # =============================================================
         if self.state.stage == STAGE_INTEREST_CONFIRM:
 
-            # YES / affirmation / greeting / question — user is engaged, advance
-            if intent in ("affirmation", "greeting", "question", "general",
-                          "location_selection", "property_type", "time_preference"):
+            # YES / affirmation / greeting — user is engaged, ask about location
+            if intent in ("affirmation", "greeting"):
                 _cancel_llm()
-
-                # If they gave a direct data intent, handle it immediately
-                if intent == "location_selection":
-                    location = self._extract_location(text)
-                    if location:
-                        self.memory.booking.location = location
-                        self.state.stage = STAGE_PROPERTY_TYPE
-                        next_prompt = self._get_proactive_prompt(STAGE_PROPERTY_TYPE)
-                        resp = self._location_ack(location) + " " + next_prompt
-                        self.memory.add_assistant(resp)
-                        yield EngineResult(text=resp, is_shortcut=True, intent="location_selection")
-                        return
-
-                if intent == "property_type":
-                    bhk = self._extract_bhk(text)
-                    if bhk:
-                        self.memory.booking.property_type = bhk.upper()
-                        self.state.stage = STAGE_LOCATION
-                        next_prompt = self._get_proactive_prompt(STAGE_LOCATION)
-                        resp = self._bhk_ack(bhk, "your area") + " " + next_prompt
-                        self.memory.add_assistant(resp)
-                        yield EngineResult(text=resp, is_shortcut=True, intent="property_type")
-                        return
-
-                # Otherwise advance to LOCATION with the proactive prompt
                 lang = self.state.language
-                resp = self._get_proactive_prompt(STAGE_LOCATION)
+                resp = _LOCATION_ASK.get(lang, _LOCATION_ASK["hi"])
                 self.memory.add_assistant(resp)
                 self.state.stage = STAGE_LOCATION
                 yield EngineResult(text=resp, is_shortcut=True, intent="interest_confirmed")
+                return
+
+            # Direct data intent — skip ahead
+            if intent == "location_selection":
+                _cancel_llm()
+                location = self._extract_location(text)
+                if location:
+                    self.memory.booking.location = location
+                    self.state.stage = STAGE_PROPERTY_TYPE
+                    next_prompt = self._get_proactive_prompt(STAGE_PROPERTY_TYPE)
+                    resp = self._location_ack(location) + " " + next_prompt
+                    self.memory.add_assistant(resp)
+                    yield EngineResult(text=resp, is_shortcut=True, intent="location_selection")
+                    return
+
+            if intent == "property_type":
+                _cancel_llm()
+                bhk = self._extract_bhk(text)
+                if bhk:
+                    self.memory.booking.property_type = bhk.upper()
+                    self.state.stage = STAGE_LOCATION
+                    resp = self._bhk_ack(bhk, "your area") + " " + _LOCATION_ASK.get(self.state.language, _LOCATION_ASK["hi"])
+                    self.memory.add_assistant(resp)
+                    yield EngineResult(text=resp, is_shortcut=True, intent="property_type")
+                    return
+
+            # Question or general — user is engaged, answer via LLM then ask location
+            if intent in ("question", "general"):
+                self.state.llm_cancelled = False
+                async for result in self._consume_llm_with_filler(
+                    llm_queue, llm_done, intent, nudge_back=False,
+                ):
+                    yield result
+                self.state.stage = STAGE_LOCATION
                 return
 
             # NO / negation / objection — politely reconfirm
@@ -809,10 +874,10 @@ class ConversationRouter:
                 yield EngineResult(text=resp, is_shortcut=True, intent="interest_reconfirm")
                 return
 
-            # Anything else — treat as engagement, advance to LOCATION
+            # Anything else — treat as engagement, ask about location
             _cancel_llm()
             lang = self.state.language
-            resp = self._get_proactive_prompt(STAGE_LOCATION)
+            resp = _LOCATION_ASK.get(lang, _LOCATION_ASK["hi"])
             self.memory.add_assistant(resp)
             self.state.stage = STAGE_LOCATION
             yield EngineResult(text=resp, is_shortcut=True, intent="interest_confirmed")
@@ -823,38 +888,48 @@ class ConversationRouter:
         # =============================================================
         if self.state.stage == STAGE_INTEREST_RECONFIRM:
 
-            # YES — user changed their mind, proceed to location
-            if intent in ("affirmation", "greeting", "question", "general",
-                          "location_selection", "property_type"):
+            # YES — user changed their mind, ask about location
+            if intent in ("affirmation", "greeting"):
                 _cancel_llm()
-
-                if intent == "location_selection":
-                    location = self._extract_location(text)
-                    if location:
-                        self.memory.booking.location = location
-                        self.state.stage = STAGE_PROPERTY_TYPE
-                        next_prompt = self._get_proactive_prompt(STAGE_PROPERTY_TYPE)
-                        resp = self._location_ack(location) + " " + next_prompt
-                        self.memory.add_assistant(resp)
-                        yield EngineResult(text=resp, is_shortcut=True, intent="location_selection")
-                        return
-
-                if intent == "property_type":
-                    bhk = self._extract_bhk(text)
-                    if bhk:
-                        self.memory.booking.property_type = bhk.upper()
-                        self.state.stage = STAGE_LOCATION
-                        next_prompt = self._get_proactive_prompt(STAGE_LOCATION)
-                        resp = self._bhk_ack(bhk, "your area") + " " + next_prompt
-                        self.memory.add_assistant(resp)
-                        yield EngineResult(text=resp, is_shortcut=True, intent="property_type")
-                        return
-
                 lang = self.state.language
-                resp = self._get_proactive_prompt(STAGE_LOCATION)
+                resp = _LOCATION_ASK.get(lang, _LOCATION_ASK["hi"])
                 self.memory.add_assistant(resp)
                 self.state.stage = STAGE_LOCATION
                 yield EngineResult(text=resp, is_shortcut=True, intent="interest_confirmed")
+                return
+
+            # Direct data intent — skip ahead
+            if intent == "location_selection":
+                _cancel_llm()
+                location = self._extract_location(text)
+                if location:
+                    self.memory.booking.location = location
+                    self.state.stage = STAGE_PROPERTY_TYPE
+                    next_prompt = self._get_proactive_prompt(STAGE_PROPERTY_TYPE)
+                    resp = self._location_ack(location) + " " + next_prompt
+                    self.memory.add_assistant(resp)
+                    yield EngineResult(text=resp, is_shortcut=True, intent="location_selection")
+                    return
+
+            if intent == "property_type":
+                _cancel_llm()
+                bhk = self._extract_bhk(text)
+                if bhk:
+                    self.memory.booking.property_type = bhk.upper()
+                    self.state.stage = STAGE_LOCATION
+                    resp = self._bhk_ack(bhk, "your area") + " " + _LOCATION_ASK.get(self.state.language, _LOCATION_ASK["hi"])
+                    self.memory.add_assistant(resp)
+                    yield EngineResult(text=resp, is_shortcut=True, intent="property_type")
+                    return
+
+            # Question or general — user is re-engaged
+            if intent in ("question", "general"):
+                self.state.llm_cancelled = False
+                async for result in self._consume_llm_with_filler(
+                    llm_queue, llm_done, intent, nudge_back=False,
+                ):
+                    yield result
+                self.state.stage = STAGE_LOCATION
                 return
 
             # NO again — gracefully close
@@ -868,10 +943,10 @@ class ConversationRouter:
                 yield EngineResult(text=resp, is_shortcut=True, intent="graceful_close")
                 return
 
-            # Anything else — give benefit of doubt, proceed to location
+            # Anything else — benefit of doubt, ask about location
             _cancel_llm()
             lang = self.state.language
-            resp = self._get_proactive_prompt(STAGE_LOCATION)
+            resp = _LOCATION_ASK.get(lang, _LOCATION_ASK["hi"])
             self.memory.add_assistant(resp)
             self.state.stage = STAGE_LOCATION
             yield EngineResult(text=resp, is_shortcut=True, intent="interest_confirmed")
@@ -909,7 +984,15 @@ class ConversationRouter:
                 yield EngineResult(text=resp, is_shortcut=True, intent="affirmation")
                 return
 
-            # Question or general conversation — answer via LLM, then nudge back
+            if intent == "negation":
+                _cancel_llm()
+                lang = self.state.language
+                resp = _LOCATION_ASK.get(lang, _LOCATION_ASK["hi"])
+                self.memory.add_assistant(resp)
+                yield EngineResult(text=resp, is_shortcut=True, intent="negation")
+                return
+
+            # Question or general conversation — answer via LLM
             if intent in ("question", "general"):
                 self.state.llm_cancelled = False
                 async for result in self._consume_llm_with_filler(
@@ -1240,7 +1323,13 @@ class ConversationRouter:
         intent: str,
         nudge_back: bool = False,
     ):
-        """Consume LLM queue with filler timeout. Optionally nudge back to flow."""
+        """Consume LLM queue with filler timeout.
+
+        nudge_back is accepted for API compatibility but no longer appends
+        a second utterance — the flow re-prompts naturally on the next turn.
+        This prevents the agent from talking non-stop (LLM answer + nudge
+        back-to-back without letting the user speak).
+        """
         full_parts: list[str] = []
 
         first_chunk = None
@@ -1268,13 +1357,6 @@ class ConversationRouter:
         if full_parts:
             full_text = " ".join(full_parts)
             self.memory.add_assistant(full_text)
-
-            # Nudge back to the booking flow
-            if nudge_back:
-                nudge = self._build_flow_nudge()
-                if nudge:
-                    self.memory.add_assistant(nudge)
-                    yield EngineResult(text=nudge, is_shortcut=True, intent="nudge")
 
     def _build_flow_nudge(self) -> str | None:
         """Build a gentle nudge to return to the booking flow after a detour. Won't repeat the same nudge."""
@@ -1325,6 +1407,14 @@ class ConversationRouter:
         system = self._build_system_prompt()
         messages: list[dict[str, str]] = [{"role": "system", "content": system}]
         messages.extend(self.memory.get_history_for_llm())
+
+        # Reinforce language at the end of messages so it's closest to generation
+        lang_names = {"hi": "Hindi", "gu": "Gujarati", "en": "English"}
+        lang_name = lang_names.get(self.state.language, "Hindi")
+        messages.append({
+            "role": "system",
+            "content": f"REMINDER: Respond ONLY in {lang_name}. Do not use any other language.",
+        })
 
         _SENTENCE_END = re.compile(r'[.!?।]\s')
         deadline = time.monotonic() + LLM_STREAM_TIMEOUT_S
@@ -1426,32 +1516,32 @@ class ConversationRouter:
             "- NEVER lose sight of the goal: get them excited about properties and book a site visit.",
         ]
 
-        parts.append(
-            "\nLANGUAGE MIRRORING (MANDATORY):"
-            "\n- You MUST respond in the SAME language the user is speaking."
-            "\n- If the user switches language mid-conversation, switch immediately to match them."
-            "\n- Never insist on a language the user has moved away from."
-        )
-
-        if self.state.language == "hi":
-            parts.append(
-                "\nCURRENT LANGUAGE: Hindi. "
-                "Respond ENTIRELY in Hindi (Devanagari script or transliterated Hindi). "
-                "Do NOT mix English words into your response. Do NOT respond in English. "
-                "Use natural Hindi as spoken in Gujarat/India."
-            )
-        elif self.state.language == "gu":
-            parts.append(
-                "\nCURRENT LANGUAGE: Gujarati. "
-                "Respond ENTIRELY in Gujarati (Gujarati script or transliterated Gujarati). "
-                "Do NOT mix English or Hindi into your response. Do NOT respond in English. "
-                "Use natural Gujarati as spoken in Gujarat."
-            )
-        else:
-            parts.append(
-                "\nCURRENT LANGUAGE: English. "
-                "Respond in clear, conversational English."
-            )
+        lang_instruction = {
+            "hi": (
+                f"\n*** LANGUAGE: HINDI — THIS IS THE HIGHEST PRIORITY RULE ***"
+                f"\nYour response MUST be ENTIRELY in Hindi."
+                f"\nUse Devanagari script or transliterated Hindi."
+                f"\nDo NOT write in Gujarati script (ગુજરાતી) or English."
+                f"\nEven if previous messages were in Gujarati, respond in Hindi NOW."
+                f"\nThis instruction overrides all conversation history."
+            ),
+            "gu": (
+                f"\n*** LANGUAGE: GUJARATI — THIS IS THE HIGHEST PRIORITY RULE ***"
+                f"\nYour response MUST be ENTIRELY in Gujarati."
+                f"\nUse Gujarati script or transliterated Gujarati."
+                f"\nDo NOT write in Hindi/Devanagari (हिन्दी) or English."
+                f"\nEven if previous messages were in Hindi, respond in Gujarati NOW."
+                f"\nThis instruction overrides all conversation history."
+            ),
+            "en": (
+                f"\n*** LANGUAGE: ENGLISH — THIS IS THE HIGHEST PRIORITY RULE ***"
+                f"\nYour response MUST be ENTIRELY in English."
+                f"\nDo NOT write in Hindi or Gujarati."
+                f"\nEven if previous messages were in another language, respond in English NOW."
+                f"\nThis instruction overrides all conversation history."
+            ),
+        }
+        parts.append(lang_instruction.get(self.state.language, lang_instruction["hi"]))
 
         context_str = self.memory.context.to_prompt_string()
         if context_str:
@@ -1474,7 +1564,12 @@ class ConversationRouter:
         if any("઀" <= c <= "૿" for c in text_lower):
             result = ("gu", 1.0, "script")
         elif any("ऀ" <= c <= "ॿ" for c in text_lower):
-            result = ("hi", 1.0, "script")
+            # Devanagari detected — but STT often writes Gujarati in
+            # Devanagari. Check for Gujarati marker words in Devanagari.
+            if self._has_gujarati_markers_devanagari(text_lower):
+                result = ("gu", 0.9, "script_gu_markers")
+            else:
+                result = ("hi", 1.0, "script")
         else:
             hi_score = _pattern_score(text_lower, _HINDI_PATTERNS)
             gu_score = _pattern_score(text_lower, _GUJARATI_PATTERNS)
@@ -1492,6 +1587,24 @@ class ConversationRouter:
 
         self._lang_cache[text_lower] = result
         return result
+
+    @staticmethod
+    def _has_gujarati_markers_devanagari(text: str) -> bool:
+        """Detect Gujarati words written in Devanagari by STT."""
+        markers = [
+            "छे", "छु", "छो", "छीए", "छुं",
+            "जोइए", "जोईए", "जोइये",
+            "माने", "तमे", "तमने", "अमने", "अमारा", "तमारा",
+            "बरोबर", "सारु", "सारुं", "माजामा",
+            "केम", "शुं", "क्यां",
+            "आवजो", "बोलो",
+            "केमछो", "केम छो",
+            "हसे", "हतु", "हती",
+            "कालो", "अत्यारे",
+            "जोवा", "जोई", "जोवुं",
+            "बतावो", "जणावो",
+        ]
+        return any(m in text for m in markers)
 
     async def _classify_language_llm(self, text: str) -> str:
         try:
@@ -1519,9 +1632,12 @@ class ConversationRouter:
         lower = text.lower()
         if any(w in lower for w in ["hindi", "हिंदी", "हिन्दी", "હિન્દી"]):
             return "hi"
-        if any(w in lower for w in ["gujarati", "ગુજરાતી", "गुजराती"]):
+        if any(w in lower for w in ["gujarati", "ગુજરાતી", "गुजराती", "ગુજરાતી"]):
             return "gu"
-        if any(w in lower for w in ["english", "अंग्रेज़ी", "अंग्रेजी", "અંગ્રેજી", "angrezi"]):
+        if any(w in lower for w in [
+            "english", "इंग्लिश", "अंग्रेज़ी", "अंग्रेजी",
+            "અંગ્રેજી", "ઇંગ્લિશ", "angrezi", "inglish",
+        ]):
             return "en"
         return self.state.language
 

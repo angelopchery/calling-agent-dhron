@@ -15,7 +15,6 @@ import asyncio
 import json
 import logging
 import signal
-import sys
 import time
 from dataclasses import dataclass
 
@@ -63,11 +62,10 @@ QUEUE_SIZE_TTS = 5
 
 MAX_SPEECH_SECONDS = 4
 MAX_BUFFER_BYTES = SAMPLE_RATE * 2 * MAX_SPEECH_SECONDS
-MIN_SPEECH_MS = 250.0
+MIN_SPEECH_MS = 400.0
 BARGE_IN_COOLDOWN_MS = 400.0
-BARGE_IN_MIN_FRAMES = 25  # 500ms sustained speech to interrupt (reduces false triggers from echo)
-TTS_ECHO_COOLDOWN_MS = 500.0  # suppress VAD after TTS ends to avoid echo tail triggers
-TTS_ONSET_DEBOUNCE = 8  # require 8 frames (160ms) onset during/after TTS (vs 3 normally)
+BARGE_IN_MIN_FRAMES = 25
+TTS_ECHO_COOLDOWN_MS = 1000.0
 
 
 class VoicePipeline:
@@ -103,6 +101,8 @@ class VoicePipeline:
         self._tts_playing = False
         self._tts_start_time = 0.0
         self._tts_end_time = 0.0
+        self._vad_mute_until = 0.0
+        self._barge_in_occurred = False
 
         # VAD + buffering state
         self._audio_buffer = bytearray()
@@ -205,17 +205,41 @@ class VoicePipeline:
     async def _process_vad_frame(self, frame: bytes) -> None:
         raw_speech = self.vad.is_speech(frame)
 
-        # --- Echo suppression: ignore VAD during post-TTS cooldown ---
-        if not self._tts_playing and self._tts_end_time > 0:
-            echo_elapsed = (time.monotonic() - self._tts_end_time) * 1000
-            if echo_elapsed < TTS_ECHO_COOLDOWN_MS:
-                self._prev_speech = False
-                self._speech_onset_frames = 0
-                self._silence_frames = 0
-                return
+        # === FULL MUTE while TTS is playing — only allow barge-in ===
+        if self._tts_playing:
+            if raw_speech:
+                self._speech_frame_streak += 1
+            else:
+                self._speech_frame_streak = 0
 
-        # --- Debounce: require 3 consecutive frames (60ms) to confirm onset,
-        #     and 5 consecutive silence frames (100ms) to confirm end ---
+            elapsed = (time.monotonic() - self._tts_start_time) * 1000
+            if (self._speech_frame_streak >= BARGE_IN_MIN_FRAMES
+                    and elapsed > BARGE_IN_COOLDOWN_MS):
+                logger.info("[BARGE-IN] Sustained speech (%d frames) — interrupting TTS",
+                            self._speech_frame_streak)
+                await self.tts.stop()
+                self._tts_playing = False
+                self._barge_in_occurred = True
+                self._vad_mute_until = 0.0
+                self._speech_frame_streak = 0
+                self._flush_pipeline_queues()
+                self._reset_vad_state()
+            return
+
+        # === ECHO COOLDOWN after TTS ends naturally ===
+        if time.monotonic() < self._vad_mute_until:
+            if self._audio_buffer:
+                logger.debug("[ECHO] Clearing %d bytes of echo audio",
+                             len(self._audio_buffer))
+                self._audio_buffer.clear()
+                self._speech_duration_ms = 0.0
+                self._turn.flush()
+            self._prev_speech = False
+            self._speech_onset_frames = 0
+            self._silence_frames = 0
+            return
+
+        # === Normal VAD processing ===
         if raw_speech:
             self._speech_onset_frames += 1
             self._silence_frames = 0
@@ -223,39 +247,13 @@ class VoicePipeline:
             self._silence_frames += 1
             self._speech_onset_frames = 0
 
-        # Debounced speech state — stricter onset during/near TTS to reject echo
-        onset_threshold = TTS_ONSET_DEBOUNCE if self._tts_playing else 3
-        if raw_speech and self._speech_onset_frames < onset_threshold and not self._prev_speech:
-            speech = False  # not yet confirmed
+        if raw_speech and self._speech_onset_frames < 3 and not self._prev_speech:
+            speech = False
         elif not raw_speech and self._silence_frames < 5 and self._prev_speech:
-            speech = True   # hold speech state through short gaps
+            speech = True
         else:
             speech = raw_speech
 
-        # --- Barge-in with sustained speech requirement ---
-        if speech and self._tts_playing:
-            self._speech_frame_streak += 1
-            if self._speech_frame_streak >= BARGE_IN_MIN_FRAMES:
-                elapsed = (time.monotonic() - self._tts_start_time) * 1000
-                if elapsed > BARGE_IN_COOLDOWN_MS:
-                    logger.info("[BARGE-IN] Sustained speech (%d frames) — interrupting TTS",
-                                self._speech_frame_streak)
-                    await self.tts.stop()
-                    self._tts_playing = False
-                    self._speech_frame_streak = 0
-                    drained = 0
-                    while not self._tts_queue.empty():
-                        try:
-                            self._tts_queue.get_nowait()
-                            drained += 1
-                        except asyncio.QueueEmpty:
-                            break
-                    if drained:
-                        logger.info("[BARGE-IN] Drained %d stale TTS responses", drained)
-        elif not speech:
-            self._speech_frame_streak = 0
-
-        # --- Buffer speech audio ---
         if speech:
             if not self._prev_speech:
                 logger.info("[VAD] Speech start")
@@ -274,7 +272,6 @@ class VoicePipeline:
 
         self._prev_speech = speech
 
-        # --- Check turn boundary ---
         if self._turn.should_trigger():
             self._turn.flush()
 
@@ -292,12 +289,32 @@ class VoicePipeline:
             self._audio_buffer.clear()
             self._speech_duration_ms = 0.0
 
-            # Non-blocking enqueue — drop if STT is backed up
             try:
                 self._stt_queue.put_nowait(segment)
                 logger.info("[TURN] Enqueued audio segment (%.0fms)", segment.duration_ms)
             except asyncio.QueueFull:
                 logger.warning("[TURN] STT queue full — dropping segment")
+
+    def _reset_vad_state(self) -> None:
+        self._audio_buffer.clear()
+        self._speech_duration_ms = 0.0
+        self._prev_speech = False
+        self._speech_onset_frames = 0
+        self._silence_frames = 0
+        self._speech_frame_streak = 0
+        self._turn.flush()
+
+    def _flush_pipeline_queues(self) -> None:
+        drained = 0
+        for q in (self._tts_queue, self._stt_queue, self._transcript_queue):
+            while not q.empty():
+                try:
+                    q.get_nowait()
+                    drained += 1
+                except asyncio.QueueEmpty:
+                    break
+        if drained:
+            logger.info("[BARGE-IN] Drained %d items from pipeline queues", drained)
 
     # -----------------------------------------------------------------------
     # Layer 2: STT Worker
@@ -438,6 +455,10 @@ class VoicePipeline:
         """
         Consumes responses, plays via TTS.
         Tracks playback state for barge-in detection.
+
+        Ensures only one utterance plays at a time: waits for speak()
+        to fully complete before starting the next. Stale responses
+        (queued >3s ago) are dropped to prevent pile-up.
         """
         while self._running:
             try:
@@ -449,14 +470,25 @@ class VoicePipeline:
             except asyncio.CancelledError:
                 break
 
+            # Drop stale responses that have been sitting in queue too long
+            age_ms = (time.monotonic() - response.timestamp) * 1000
+            if age_ms > 3000:
+                logger.warning("[TTS] Dropping stale response (%.0fms old): %r",
+                               age_ms, response.text[:50])
+                continue
+
+            if self._tts_playing:
+                logger.info("[TTS] Previous playback still active — stopping")
+                await self.tts.stop()
+                self._tts_playing = False
+                await asyncio.sleep(0.1)
+
             try:
-                total_latency = (time.monotonic() - response.timestamp) * 1000
-                logger.info("[TTS] Playing: %r (queued %.0fms ago)", response.text, total_latency)
+                logger.info("[TTS] Playing: %r (queued %.0fms ago)", response.text, age_ms)
 
                 self._tts_playing = True
                 self._tts_start_time = time.monotonic()
 
-                # Pass current conversation language to TTS
                 if hasattr(self.tts, 'set_language') and self.conversation:
                     self.tts.set_language(self.conversation.state.language)
 
@@ -465,9 +497,20 @@ class VoicePipeline:
             except asyncio.CancelledError:
                 logger.info("[TTS] Interrupted")
             except Exception:
-                logger.exception("[TTS] Playback failed")
+                logger.exception("[TTS] Playback failed — recovering")
+                # Reset TTS state so next utterance can play
+                try:
+                    await self.tts.stop()
+                except Exception:
+                    pass
             finally:
                 self._tts_playing = False
                 self._tts_end_time = time.monotonic()
+                if self._barge_in_occurred:
+                    self._barge_in_occurred = False
+                else:
+                    self._vad_mute_until = (
+                        time.monotonic() + TTS_ECHO_COOLDOWN_MS / 1000.0
+                    )
 
         logger.info("[TTS] Layer stopped")
