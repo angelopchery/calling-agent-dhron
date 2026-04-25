@@ -62,7 +62,7 @@ _WORD_TO_NUM: dict[str, str] = {
     "એક": "1", "બે": "2", "ત્રણ": "3", "ચાર": "4", "પાંચ": "5",
 }
 
-# Hindi/Gujarati script BHK variants as spoken by Sarvam STT
+# Hindi/Gujarati script BHK variants as commonly emitted by Indian-locale STT
 _DEVANAGARI_BHK_PATTERNS: dict[str, str] = {
     "बीएचके": "bhk",
     "बी एच के": "bhk",

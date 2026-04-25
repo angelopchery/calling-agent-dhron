@@ -203,7 +203,11 @@ class VoicePipeline:
             logger.info("[AUDIO] Layer stopped (%d frames)", self._frame_count)
 
     async def _process_vad_frame(self, frame: bytes) -> None:
-        raw_speech = self.vad.is_speech(frame)
+        # Skip calibration accumulation while TTS is playing or in echo
+        # cooldown — speaker bleed would otherwise poison the noise floor
+        # and push the speech threshold above achievable levels.
+        in_tts_window = self._tts_playing or time.monotonic() < self._vad_mute_until
+        raw_speech = self.vad.is_speech(frame, count_for_calibration=not in_tts_window)
 
         # === FULL MUTE while TTS is playing — only allow barge-in ===
         if self._tts_playing:

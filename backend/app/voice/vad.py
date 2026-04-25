@@ -44,10 +44,12 @@ class VoiceActivityDetector:
         calibration_frames: int = 30,
         calibration_multiplier: float = 4.0,
         minimum_threshold: float = 5.0,
+        maximum_threshold: float = 1500.0,
     ) -> None:
         self.sample_rate = sample_rate
         self._threshold: float = energy_threshold or 0.0
         self._minimum_threshold = minimum_threshold
+        self._maximum_threshold = maximum_threshold
         self._calibration_multiplier = calibration_multiplier
 
         # Calibration state
@@ -66,7 +68,7 @@ class VoiceActivityDetector:
     def calibrated(self) -> bool:
         return self._calibrated
 
-    def is_speech(self, frame: bytes) -> bool:
+    def is_speech(self, frame: bytes, count_for_calibration: bool = True) -> bool:
         energy = self._compute_energy(frame)
 
         # Periodic debug log every 250 frames (~5 seconds)
@@ -77,11 +79,14 @@ class VoiceActivityDetector:
                 energy, self._threshold, self._calibrated,
             )
 
-        # Auto-calibration phase: collect noise samples, always return False
+        # Auto-calibration phase: collect noise samples, always return False.
+        # Pipeline passes count_for_calibration=False during TTS playback /
+        # echo cooldown so speaker bleed doesn't poison the noise floor.
         if not self._calibrated:
-            self._calibration_energies.append(energy)
-            if len(self._calibration_energies) >= self._calibration_target:
-                self._finish_calibration()
+            if count_for_calibration:
+                self._calibration_energies.append(energy)
+                if len(self._calibration_energies) >= self._calibration_target:
+                    self._finish_calibration()
             return False
 
         return energy > self._threshold
@@ -93,15 +98,29 @@ class VoiceActivityDetector:
 
     def _finish_calibration(self) -> None:
         arr = np.array(self._calibration_energies)
-        noise_mean = float(arr.mean())
-        noise_p95 = float(np.percentile(arr, 95))
-        noise_max = float(arr.max())
+        # Robust noise floor: use only the quietest half of the calibration
+        # frames. A transient burst (door, breath, brief speech, residual
+        # TTS echo trail) would otherwise pull p95 high enough to set the
+        # threshold above achievable speech levels — making the agent deaf
+        # for the rest of the session.
+        quiet_half = np.sort(arr)[: max(1, len(arr) // 2)]
+        noise_mean = float(quiet_half.mean())
+        noise_p95 = float(np.percentile(quiet_half, 95))
+        noise_max = float(quiet_half.max())
 
+        raw_threshold = noise_p95 * self._calibration_multiplier
+        capped = raw_threshold > self._maximum_threshold
         self._threshold = max(
-            noise_p95 * self._calibration_multiplier,
+            min(raw_threshold, self._maximum_threshold),
             self._minimum_threshold,
         )
         self._calibrated = True
+        if capped:
+            logger.warning(
+                "[VAD] Calibration noise too high — threshold capped at %.1f "
+                "(uncapped would be %.1f). Environment may be unusually loud.",
+                self._maximum_threshold, raw_threshold,
+            )
 
         logger.info(
             "[VAD] Calibrated in %d frames (%.0fms) — "

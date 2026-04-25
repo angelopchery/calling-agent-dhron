@@ -6,7 +6,7 @@ a real-audio-driven stand-in that tracks actual speech duration — no
 fake phrases, no canned text. It exists solely to give the TurnManager
 word-count signals proportional to real speech timing.
 
-Replace with SarvamStreamingSTT (or any provider) by subclassing.
+Replace with GoogleStreamingSTT (or any provider) by subclassing.
 """
 
 from __future__ import annotations
@@ -57,7 +57,7 @@ class PlaceholderSTT(StreamingSTT):
     text at ~1 word per 200ms (natural speech cadence of ~5 words/sec).
 
     This gives the TurnManager real duration-based word counts without
-    any fake transcription. When Sarvam STT is integrated, this class
+    any fake transcription. When Google streaming STT is wired in, this class
     is swapped out — the StreamingSTT interface stays identical.
     """
 

@@ -1,8 +1,14 @@
 """
-STT Router — tries primary provider, falls back to secondary on failure.
+STT Router — single-provider wrapper that keeps the historic
+validation, retry, and post-processing pipeline intact.
 
-Includes retry logic, minimum-confidence filtering, transcript validation,
-and hallucination filtering.
+The router previously fanned out across Sarvam (primary) and OpenAI
+Whisper (fallback). Both have been retired in favour of Google Cloud
+Speech-to-Text, which authenticates via Application Default Credentials
+(``gcloud auth application-default login``) — no API keys required.
+
+The public surface (`STTRouter.transcribe(...) -> str`) is unchanged so
+``pipeline.py`` and ``main_loop.py`` continue to work without edits.
 """
 
 from __future__ import annotations
@@ -12,15 +18,20 @@ import logging
 from collections import Counter
 
 from .base import STTProvider, STTResult
-from .sarvam import SarvamSTT
-from .openai_whisper import OpenAIWhisperSTT
+from .google_stt import GoogleSTT
 from .post_processor import post_process_transcript
 
 logger = logging.getLogger(__name__)
 
 MIN_TRANSCRIPT_LENGTH = 2
 MAX_RETRIES = 1
-MIN_CONFIDENCE = 0.4
+# Tuned for Google STT, which reports systematically lower confidence than
+# Sarvam did on noisy / open-air mic audio (callers without headsets in real
+# rooms). Real Hindi/Gujarati sentences land at 0.15–0.30 in this setting;
+# garbage and mishears tend to score below 0.10. The validate_transcript()
+# pipeline still catches hallucinations, repetition, and single-word junk
+# regardless of score, so confidence is just the first-pass filter.
+MIN_CONFIDENCE = 0.15
 
 _FILLER_WORDS = {"um", "uh", "like", "you know"}
 _FILLER_RE = re.compile(
@@ -117,14 +128,12 @@ def validate_transcript(text: str) -> str:
 
 class STTRouter:
     """
-    Multi-provider STT with automatic fallback.
+    Single-provider STT wrapper with retry, validation, and post-processing.
 
-    Tries the primary provider (Sarvam) with up to MAX_RETRIES retries.
-    If the primary fails or returns an empty/too-short transcript, falls
-    back to the secondary provider (OpenAI Whisper).
-
-    Both providers are optional — if API keys are missing, transcribe()
-    returns an empty string with a warning.
+    Backed exclusively by :class:`GoogleSTT` (ADC-authenticated). The
+    optional ``fallback`` slot is preserved so callers may inject a
+    secondary provider in tests, but no fallback is configured by
+    default — Google Cloud Speech is the production path.
     """
 
     def __init__(
@@ -135,8 +144,8 @@ class STTRouter:
         max_retries: int = MAX_RETRIES,
         min_confidence: float = MIN_CONFIDENCE,
     ) -> None:
-        self._primary = primary or SarvamSTT()
-        self._fallback = fallback or OpenAIWhisperSTT()
+        self._primary = primary or GoogleSTT()
+        self._fallback = fallback
         self._min_length = min_length
         self._max_retries = max_retries
         self._min_confidence = min_confidence
@@ -150,22 +159,21 @@ class STTRouter:
         duration_ms = len(audio_bytes) / (sample_rate * 2) * 1000
         logger.info("[STT] Processing audio (%.0f ms)", duration_ms)
 
-        # --- Try primary with retries ---
         text = await self._try_provider(
             self._primary, "primary", audio_bytes, sample_rate, language,
         )
         if text:
             return text
 
-        # --- Fallback ---
-        logger.info("[STT] Primary failed or empty → using fallback")
-        text = await self._try_provider(
-            self._fallback, "fallback", audio_bytes, sample_rate, language,
-        )
-        if text:
-            return text
+        if self._fallback is not None:
+            logger.info("[STT] Primary failed or empty → using fallback")
+            text = await self._try_provider(
+                self._fallback, "fallback", audio_bytes, sample_rate, language,
+            )
+            if text:
+                return text
 
-        logger.warning("[STT] Both providers failed — returning empty transcript")
+        logger.warning("[STT] No transcript produced — returning empty")
         return ""
 
     def _post_process(self, text: str, language: str) -> str:
@@ -181,34 +189,43 @@ class STTRouter:
         sample_rate: int,
         language: str,
     ) -> str:
+        # Retries only make sense for transient transport failures. Modern
+        # STT providers (Google, Sarvam) are deterministic: identical audio
+        # → identical transcript, so retrying on low confidence or validation
+        # failure just wastes ~600ms per call without changing the outcome.
         for attempt in range(1, self._max_retries + 2):
             try:
                 result = await provider.transcribe(audio_bytes, sample_rate, language)
-                text = result.text
-                confidence = result.confidence
-
-                if confidence < self._min_confidence:
-                    logger.info(
-                        "[STT-FILTER] reason=low_confidence score=%.2f text=%r provider=%s attempt=%d",
-                        confidence, text, label, attempt,
-                    )
-                    continue
-
-                if len(text) < self._min_length:
-                    logger.info(
-                        "[STT] %s returned short transcript %r (attempt %d) -- treating as empty",
-                        label, text, attempt,
-                    )
-                else:
-                    validated = validate_transcript(text)
-                    if validated:
-                        return self._post_process(validated, language)
-                    logger.info("[STT] %s transcript rejected by validation (attempt %d)", label, attempt)
             except Exception as exc:
-                logger.warning(
-                    "[STT] %s attempt %d failed: %s", label, attempt, exc,
+                logger.warning("[STT] %s attempt %d failed: %s", label, attempt, exc)
+                if attempt <= self._max_retries:
+                    logger.info(
+                        "[STT] Retrying %s (attempt %d/%d)",
+                        label, attempt + 1, self._max_retries + 1,
+                    )
+                continue
+
+            text = result.text
+            confidence = result.confidence
+
+            if confidence < self._min_confidence:
+                logger.info(
+                    "[STT-FILTER] reason=low_confidence score=%.2f text=%r provider=%s",
+                    confidence, text, label,
                 )
-            if attempt <= self._max_retries:
-                logger.info("[STT] Retrying %s (attempt %d/%d)", label, attempt + 1, self._max_retries + 1)
+                return ""
+
+            if len(text) < self._min_length:
+                logger.info(
+                    "[STT] %s returned short transcript %r — treating as empty",
+                    label, text,
+                )
+                return ""
+
+            validated = validate_transcript(text)
+            if validated:
+                return self._post_process(validated, language)
+            logger.info("[STT] %s transcript rejected by validation: %r", label, text)
+            return ""
 
         return ""

@@ -1,6 +1,6 @@
 from .audio_input import AudioInputStream, MicrophoneStream
 from .vad import VoiceActivityDetector
-from .stt import STTProvider, STTRouter, SarvamSTT, OpenAIWhisperSTT
+from .stt import STTProvider, STTRouter, GoogleSTT, GoogleStreamingSTT
 from .tts_stream import StreamingTTS
 from .tts_cartesia import CartesiaTTS
 from .tts_sarvam import SarvamTTS
@@ -15,8 +15,8 @@ __all__ = [
     "VoiceActivityDetector",
     "STTProvider",
     "STTRouter",
-    "SarvamSTT",
-    "OpenAIWhisperSTT",
+    "GoogleSTT",
+    "GoogleStreamingSTT",
     "StreamingTTS",
     "CartesiaTTS",
     "SarvamTTS",
