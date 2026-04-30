@@ -31,6 +31,15 @@ from .stt.post_processor import match_location, match_bhk
 # ---------------------------------------------------------------------------
 
 STAGE_GREETING = "GREETING"
+# NAME_CONFIRM is a structural placeholder — the user's first reply to the
+# greeting is silently captured and we advance straight to PROJECT_CONFIRM.
+# Replace the silent passthrough with an explicit name-ask once the wording
+# is finalised by the business.
+STAGE_NAME_CONFIRM = "NAME_CONFIRM"
+STAGE_PROJECT_CONFIRM = "PROJECT_CONFIRM"
+STAGE_PROPERTY_STATUS = "PROPERTY_STATUS"
+STAGE_RENT_OR_BUY = "RENT_OR_BUY"
+STAGE_PROPERTY_INFO = "PROPERTY_INFO"
 STAGE_INTEREST_CONFIRM = "INTEREST_CONFIRM"
 STAGE_INTEREST_RECONFIRM = "INTEREST_RECONFIRM"
 STAGE_LOCATION = "LOCATION"
@@ -41,13 +50,18 @@ STAGE_CLOSING = "CLOSING"
 
 _STAGE_ORDER = {
     STAGE_GREETING: 0,
-    STAGE_INTEREST_CONFIRM: 1,
-    STAGE_INTEREST_RECONFIRM: 2,
-    STAGE_LOCATION: 3,
-    STAGE_PROPERTY_TYPE: 4,
-    STAGE_SCHEDULING: 5,
-    STAGE_CONFIRMATION: 6,
-    STAGE_CLOSING: 7,
+    STAGE_NAME_CONFIRM: 1,
+    STAGE_PROJECT_CONFIRM: 2,
+    STAGE_PROPERTY_STATUS: 3,
+    STAGE_RENT_OR_BUY: 4,
+    STAGE_PROPERTY_INFO: 5,
+    STAGE_INTEREST_CONFIRM: 6,
+    STAGE_INTEREST_RECONFIRM: 7,
+    STAGE_LOCATION: 8,
+    STAGE_PROPERTY_TYPE: 9,
+    STAGE_SCHEDULING: 10,
+    STAGE_CONFIRMATION: 11,
+    STAGE_CLOSING: 12,
 }
 
 # ---------------------------------------------------------------------------
@@ -58,7 +72,7 @@ MAX_RESPONSE_LENGTH = 350
 LLM_TIMEOUT = 5.0
 LLM_MAX_TOKENS = 150
 FILLER_TIMEOUT_S = 1.5
-LLM_STREAM_TIMEOUT_S = 4.0
+LLM_STREAM_TIMEOUT_S = 7.0
 INTENT_CLASSIFY_TIMEOUT_S = 1.0
 
 logger = logging.getLogger(__name__)
@@ -95,6 +109,7 @@ class ConversationState:
         self.objection_handled: bool = False
         self.language_locked: bool = False
         self.language_lock_turns: int = 0
+        self.decline_count: int = 0
 
 
 # ---------------------------------------------------------------------------
@@ -128,6 +143,14 @@ _OBJECTION_PATTERNS = [
     "not interested", "busy", "call later", "already using",
     "don't need", "no time", "don't want", "stop calling",
     "not looking", "no need", "wrong number", "remove my number",
+    # "later" / "not now" — deferral is an objection, treat it kindly
+    "talk later", "later please", "maybe later", "some other time",
+    "another time", "right now", "not right now",
+    "baad mein", "baad me", "baadme", "baad m",
+    "phir baat", "phir karte", "phir baat karenge",
+    "abhi nahi", "abhi nai", "abhi busy",
+    "fursat",
+    "pachhi", "pachhi vaat",
 ]
 
 _TIME_PATTERNS = [
@@ -154,6 +177,15 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
     if any(w in lower for w in ["दिलचस्पी नहीं", "बिज़ी", "ज़रूरत नहीं",
                                   "રસ નથી", "વ્યસ્ત", "જરૂર નથી"]):
         return "objection"
+    # Deferral patterns — "later / not now" in Devanagari and Gujarati script.
+    # Treated as objection so we back off gracefully instead of pushing.
+    if any(w in text for w in [
+        "बाद में", "बाद मे", "बादमें", "बादमे",
+        "अभी नहीं", "अभी नही", "अभी बिज़ी", "अभी busy",
+        "फिर बात", "फिर बाद",
+        "પછી", "પછીથી", "પછી વાત", "અત્યારે નહીં", "અત્યારે નથી",
+    ]):
+        return "objection"
 
     # Language switch request — highest priority after objection.
     # Catches romanized, Devanagari, and Gujarati script requests.
@@ -169,6 +201,14 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
         "speak in hindi", "speak in english", "speak in gujarati",
         "switch to hindi", "switch to english", "switch to gujarati",
         "in english", "in hindi", "in gujarati",
+        # Common short asks — "english please", "english only", etc.
+        "english please", "hindi please", "gujarati please",
+        "only english", "only hindi", "only gujarati",
+        "english only", "hindi only", "gujarati only",
+        "can you speak english", "can you speak hindi", "can you speak gujarati",
+        "can you talk english", "can you talk hindi", "can you talk gujarati",
+        "could you speak english", "could you speak hindi", "could you speak gujarati",
+        "talk english", "talk hindi", "talk gujarati",
     ]
     if any(p in lower for p in _lang_switch_phrases):
         return "language_switch"
@@ -194,6 +234,45 @@ def detect_intent(text: str, stage: str = STAGE_GREETING) -> str:
     if re.search(r"(?:english|hindi|gujarati|इंग्लिश|अंग्रेज़ी|अंग्रेजी|हिंदी|हिन्दी|गुजराती|ગુજરાતી|અંગ્રેજી|હિન્દી|ઇંગ્લિશ).{0,15}(?:बात|बोल|bol|baat|bolo|boliye|વાત|બોલ)", lower):
         return "language_switch"
     if re.search(r"(?:बात|बोल|bol|baat|bolo|boliye|વાત|બોલ).{0,15}(?:english|hindi|gujarati|इंग्लिश|अंग्रेज़ी|अंग्रेजी|हिंदी|हिन्दी|गुजराती|ગુજરાતી|અંગ્રેજી|હિન્દી|ઇંગ્લિશ)", lower):
+        return "language_switch"
+
+    # Two language names co-mentioned within a 30-char window — strong signal
+    # the user is talking about switching ("english instead of hindi", "switch
+    # from hindi to english", "hindi or english", etc.).
+    if re.search(
+        r"(english|hindi|gujarati).{1,30}(english|hindi|gujarati)",
+        lower,
+    ):
+        return "language_switch"
+
+    # Negation / restriction patterns — user implicitly asks to switch by
+    # saying "I don't know X" / "X नहीं आती" / "સિર્ફ Y" / "only Y". These
+    # must be classified as language_switch so the deterministic handler
+    # responds (instead of the LLM, which sometimes hallucinates refusals
+    # like "मैं हिंदी में ही बात करूँगा"). The destination language is
+    # resolved by _extract_requested_language's last-position fallback.
+    _lang_neg_lat = r"(?:english|hindi|gujarati|inglish|angrezi)"
+    _lang_neg_dev = r"(?:इंग्लिश|अंग्रेज़ी|अंग्रेजी|हिंदी|हिन्दी|गुजराती)"
+    _lang_neg_guj = r"(?:ગુજરાતી|અંગ્રેજી|હિન્દી|ઇંગ્લિશ)"
+    _lang_neg_any = f"(?:{_lang_neg_lat[3:-1]}|{_lang_neg_dev[3:-1]}|{_lang_neg_guj[3:-1]})"
+    # English: "don't know/speak X", "can't speak X", "only know/speak X"
+    if re.search(
+        rf"(?:don'?t|do not|can'?t|cannot|only|just)\s+(?:know|speak|talk|understand)\s+{_lang_neg_lat}",
+        lower,
+    ):
+        return "language_switch"
+    # Negation word near a language name (either order, ~25 char window).
+    # Covers Devanagari नहीं, Gujarati નથી, romanized nahi/nahin.
+    _neg_words = r"(?:नहीं|नहि|नही|न्ही|નથી|નહિ|નહી|નહીં|nahi|nahin|nai)"
+    if re.search(rf"{_lang_neg_any}[^\n]{{0,25}}{_neg_words}", text, re.IGNORECASE):
+        return "language_switch"
+    if re.search(rf"{_neg_words}[^\n]{{0,25}}{_lang_neg_any}", text, re.IGNORECASE):
+        return "language_switch"
+    # Restriction word ("only" in various scripts) near a language name.
+    _only_words = r"(?:सिर्फ|केवल|खाली|बस|ફક્ત|માત્ર|સિર્ફ|બસ|ખાલી|sirf|sirff|fakt|fakta|kewal|khali)"
+    if re.search(rf"{_only_words}[^\n]{{0,20}}{_lang_neg_any}", text, re.IGNORECASE):
+        return "language_switch"
+    if re.search(rf"{_lang_neg_any}[^\n]{{0,20}}{_only_words}", text, re.IGNORECASE):
         return "language_switch"
 
     # Location selection
@@ -342,23 +421,58 @@ def _pattern_score(text: str, patterns: list[str]) -> int:
     return sum(1 for p in patterns if p in words)
 
 
+_SLOT_HOUR_RE = re.compile(r"(\d{1,2}):(\d{2})\s*(AM|PM)", re.IGNORECASE)
+
+
+def _slot_hour_24(time_str: str) -> int:
+    """Parse a slot string like '10:00 AM' into 24-hour integer (10, 14, etc)."""
+    m = _SLOT_HOUR_RE.match(time_str)
+    if not m:
+        return -1
+    h = int(m.group(1))
+    period = m.group(3).upper()
+    if period == "PM" and h < 12:
+        h += 12
+    elif period == "AM" and h == 12:
+        h = 0
+    return h
+
+
+def _slot_period(time_str: str) -> str:
+    """Classify a slot time as morning / afternoon / evening."""
+    h = _slot_hour_24(time_str)
+    if 0 <= h < 12:
+        return "morning"
+    if h < 17:
+        return "afternoon"
+    return "evening"
+
+
 # ---------------------------------------------------------------------------
 # Objection responses (multilingual, Pramukh-specific)
 # ---------------------------------------------------------------------------
 
 _OBJECTION_RESPONSES: dict[str, list[str]] = {
     "en": [
-        "I completely understand. Just so you know, Pramukh Group has some very attractive options right now. Would you like me to share some quick details?",
-        "No problem at all. When would be a better time to discuss? We have some exciting projects coming up.",
+        "Of course, I completely understand. Would another time work better for a quick call? Otherwise no problem at all.",
+        "No problem at all — when would be a more convenient time? Just a brief chat.",
     ],
     "hi": [
-        "बिल्कुल समझ सकता हूँ। बस इतना बताना चाहता था कि Pramukh Group में अभी बहुत अच्छे विकल्प उपलब्ध हैं।",
-        "कोई बात नहीं, कब बात करना सही रहेगा? कुछ बहुत अच्छे प्रोजेक्ट्स आ रहे हैं।",
+        "जी बिल्कुल, मैं समझता हूँ। क्या किसी और समय एक छोटी सी बात हो सकती है? वरना कोई बात नहीं।",
+        "कोई बात नहीं। आप बताइए कब सुविधाजनक रहेगा, बस एक छोटी सी बात करनी है।",
     ],
     "gu": [
-        "બિલકુલ સમજું છું. બસ એટલું કહેવું હતું કે Pramukh Group માં અત્યારે ખૂબ સારા વિકલ્પો છે.",
-        "કોઈ વાત નહીં, પછી ક્યારે વાત કરીએ? કેટલાક ખૂબ સારા પ્રોજેક્ટ્સ આવી રહ્યા છે.",
+        "જી બિલકુલ, હું સમજું છું. શું બીજા કોઈ સમયે થોડી વાત થઈ શકે? નહીંતર કોઈ વાત નહીં.",
+        "કોઈ વાત નહીં. તમે જણાવો ક્યારે અનુકૂળ રહેશે, બસ થોડી વાત કરવી છે.",
     ],
+}
+
+# Used after a SECOND deferral/objection in the same call — we back off
+# completely with a warm goodbye instead of pushing.
+_DECLINE_FAREWELL_RESPONSES: dict[str, str] = {
+    "en": "Of course, no problem at all. I won't take any more of your time — have a wonderful day, take care!",
+    "hi": "जी बिल्कुल, कोई बात नहीं। मैं आपका और समय नहीं लूँगा। आपका दिन शुभ रहे, फिर मिलते हैं!",
+    "gu": "જી બિલકુલ, કોઈ વાત નહીં. હું તમારો વધુ સમય નહીં લઉં. તમારો દિવસ શુભ રહે, ફરી મળીશું!",
 }
 
 # ---------------------------------------------------------------------------
@@ -467,7 +581,7 @@ _PROACTIVE_PROMPTS: dict[str, dict[str, str]] = {
 # ---------------------------------------------------------------------------
 
 _OPENING_GREETING: str = (
-    "Hello, Namaste! मैं Pramukh Group से बात कर रहा हूँ।"
+    "Good afternoon! Namaste, मैं Pramukh Group से बात कर रहा हूँ।"
 )
 
 # ---------------------------------------------------------------------------
@@ -530,6 +644,135 @@ _LOCATION_ASK: dict[str, str] = {
     "hi": "बढ़िया! आप किस लोकेशन में देखना चाहेंगे?",
     "gu": "સરસ! તમે કઈ લોકેશનમાં જોવા માંગો છો?",
 }
+
+# ---------------------------------------------------------------------------
+# New flow prompts — project / status / rent-or-buy / property info
+# ---------------------------------------------------------------------------
+
+_PROJECT_CONFIRM_PROMPT: dict[str, str] = {
+    "en": "Could you confirm which Pramukh Group project you're interested in?",
+    "hi": "क्या आप बता सकते हैं कि आप हमारे किस Pramukh Group प्रोजेक्ट में दिलचस्पी रखते हैं?",
+    "gu": "શું તમે જણાવી શકો કે તમે અમારા કયા Pramukh Group પ્રોજેક્ટમાં રસ ધરાવો છો?",
+}
+
+_PROPERTY_STATUS_PROMPT: dict[str, str] = {
+    "en": "Got it. Are you looking for a ready-made flat or one that is under construction?",
+    "hi": "समझ गया। क्या आप ready-made फ्लैट देख रहे हैं या under-construction?",
+    "gu": "સમજ્યો. શું તમે ready-made ફ્લેટ શોધી રહ્યા છો કે under-construction?",
+}
+
+_RENT_OR_BUY_PROMPT: dict[str, str] = {
+    "en": "And is this for rent, or are you looking to buy?",
+    "hi": "और यह किराये के लिए है या खरीदने के लिए?",
+    "gu": "અને આ ભાડે માટે છે કે ખરીદવા માટે?",
+}
+
+# Property info delivered after we know status (ready / under-construction)
+# and intent (rent / buy). Tells about flats and condition, then pivots to
+# scheduling a site visit.
+_PROPERTY_INFO_READY: dict[str, str] = {
+    "en": (
+        "Excellent! Our ready-made flats are fully finished — modern interiors, "
+        "all amenities active, and ready to move in immediately. We have 2 BHK, "
+        "3 BHK, and 4 BHK options available. Would you like to schedule a quick site visit?"
+    ),
+    "hi": (
+        "बहुत बढ़िया! हमारे ready-made फ्लैट्स पूरी तरह तैयार हैं — modern interiors, "
+        "सारी amenities active हैं, और तुरंत move-in कर सकते हैं। हमारे पास 2 BHK, "
+        "3 BHK और 4 BHK के विकल्प हैं। क्या एक site visit schedule करें?"
+    ),
+    "gu": (
+        "ખૂબ સરસ! અમારા ready-made ફ્લેટ્સ સંપૂર્ણ તૈયાર છે — modern interiors, "
+        "બધી amenities active છે, અને તરત જ move-in કરી શકો. અમારી પાસે 2 BHK, "
+        "3 BHK અને 4 BHK ના વિકલ્પો છે. શું એક site visit schedule કરીએ?"
+    ),
+}
+
+_PROPERTY_INFO_UNDER: dict[str, str] = {
+    "en": (
+        "Great choice! Our under-construction projects offer pre-launch pricing, "
+        "modern designs, and flexible payment plans. Possession is in 18 to 24 months. "
+        "We have 2 BHK, 3 BHK, and 4 BHK layouts. Would you like to schedule a site visit "
+        "to see the layouts and sample flat?"
+    ),
+    "hi": (
+        "बढ़िया choice! हमारे under-construction projects में pre-launch pricing, "
+        "modern designs, और flexible payment plans मिलते हैं। 18 से 24 महीनों में "
+        "possession मिलता है। हमारे पास 2 BHK, 3 BHK और 4 BHK के layouts हैं। "
+        "क्या एक site visit schedule करें ताकि आप layout और sample flat देख सकें?"
+    ),
+    "gu": (
+        "સરસ choice! અમારા under-construction projects માં pre-launch pricing, "
+        "modern designs, અને flexible payment plans મળે છે. 18 થી 24 મહિનામાં "
+        "possession મળી જાય છે. અમારી પાસે 2 BHK, 3 BHK અને 4 BHK ના layouts છે. "
+        "શું એક site visit schedule કરીએ જેથી તમે layout અને sample flat જોઈ શકો?"
+    ),
+}
+
+# ---------------------------------------------------------------------------
+# Status / transaction-type extraction helpers
+# ---------------------------------------------------------------------------
+
+_READY_KEYWORDS = (
+    "ready", "ready made", "ready-made", "readymade", "readytomove",
+    "ready to move", "move in", "move-in", "movein",
+    "tayar", "taiyar", "complete", "finished", "occupancy",
+    "तैयार", "रेडी", "completed",
+    "તૈયાર", "રેડી",
+)
+
+_UNDER_CONSTRUCTION_KEYWORDS = (
+    "under construction", "under-construction", "underconstruction",
+    "under con", "uc", "construction", "new launch", "newlaunch",
+    "pre launch", "pre-launch", "prelaunch", "upcoming",
+    "naya", "naya project", "nirman",
+    "निर्माण", "अंडर कंस्ट्रक्शन", "नया", "नई",
+    "નિર્માણ", "અંડર કન્સ્ટ્રક્શન", "નવો", "નવી",
+)
+
+_RENT_KEYWORDS = (
+    "rent", "rental", "lease", "leasing", "for rent",
+    "kiraya", "kiraye", "kirae", "bhada", "bhade",
+    "किराया", "किराये", "किराए", "भाड़ा", "भाडा",
+    "ભાડે", "ભાડા", "ભાડું",
+)
+
+_BUY_KEYWORDS = (
+    "buy", "purchase", "buying", "purchasing", "own", "ownership",
+    "kharidna", "kharidne", "kharidu", "kharido", "lena", "khareed",
+    "खरीद", "ख़रीद", "खरीदना", "खरीदने",
+    "ખરીદ", "ખરીદવા", "ખરીદવું", "લેવા",
+)
+
+
+def _detect_property_status(text: str) -> str | None:
+    """Return 'ready_made' or 'under_construction' if either is mentioned."""
+    lower = text.lower()
+    has_ready = any(kw in lower or kw in text for kw in _READY_KEYWORDS)
+    has_uc = any(kw in lower or kw in text for kw in _UNDER_CONSTRUCTION_KEYWORDS)
+    if has_uc:
+        return "under_construction"
+    if has_ready:
+        return "ready_made"
+    return None
+
+
+def _detect_transaction_type(text: str) -> str | None:
+    """Return 'rent' or 'buy' if either is mentioned.
+
+    Rent is checked first because its keywords ('kiraya', 'rent', 'lease') are
+    specific and intentional, whereas buy keywords overlap with generic verbs
+    ('lena' = 'to take' is generic and only means 'buy' in context). When the
+    user says 'kiraye par lena hai', both fire — but the rent intent wins.
+    """
+    lower = text.lower()
+    has_rent = any(kw in lower or kw in text for kw in _RENT_KEYWORDS)
+    has_buy = any(kw in lower or kw in text for kw in _BUY_KEYWORDS)
+    if has_rent:
+        return "rent"
+    if has_buy:
+        return "buy"
+    return None
 
 
 # ---------------------------------------------------------------------------
@@ -665,11 +908,22 @@ class ConversationRouter:
                 self.state.language_locked = False
                 logger.info("[LANG] Lock expired after %d turns", self.state.language_lock_turns)
 
-        # Gujarati script or markers always override — unambiguous
-        if is_gujarati_detected:
+        # Gujarati script or markers — switch ONLY if not locked to a different
+        # language. Explicit user request (intent="language_switch") is the only
+        # thing that can override the lock; Devanagari Gujarati-marker words
+        # like "माने" / "छे" appearing inside otherwise-Hindi STT output must
+        # not flip the agent back to Gujarati.
+        if is_gujarati_detected and (
+            not self.state.language_locked or prev_lang == "gu"
+        ):
             if self.state.language != "gu":
                 logger.info("[LANG] Switching to Gujarati (src=%s)", src)
             self.state.language = "gu"
+        elif is_gujarati_detected:
+            logger.info(
+                "[LANG] Ignoring Gujarati markers (locked to %s, src=%s)",
+                prev_lang, src,
+            )
         elif src == "pattern" and conf >= 0.7:
             # Pattern-based detection: Hindi/Gujarati romanized words
             self.state.language = detected_lang
@@ -679,6 +933,22 @@ class ConversationRouter:
             # language is not locked.
             if prev_lang != "gu" or not self.state.language_locked:
                 self.state.language = "hi"
+        elif detected_lang == "en" and src in ("default", "pattern"):
+            # Pure-Latin / non-Indic text. Switch to English when it's a
+            # confident multi-word signal — single ASCII tokens like "ok" or
+            # "haan" shouldn't flip a Hindi/Gujarati session. Crucially, this
+            # branch runs even when language_locked, so a user can switch from
+            # Hindi to English mid-call just by speaking English.
+            word_count = len(text.split())
+            if word_count >= 2 and prev_lang != "en":
+                logger.info(
+                    "[LANG] Switching to English (ascii multi-word, src=%s, words=%d)",
+                    src, word_count,
+                )
+                self.state.language = "en"
+                # Soft-decay any prior lock so subsequent turns aren't re-locked
+                self.state.language_locked = False
+                self.state.language_lock_turns = 0
         # Ambiguous/default: preserve current language
 
         self.state.lang_confidence = conf
@@ -711,6 +981,12 @@ class ConversationRouter:
         self.state.last_intent = intent
         logger.info('[INTENT] "%s" -> %s (stage=%s)', text, intent, self.state.stage)
 
+        # Reset decline counter when the user re-engages with a non-objection
+        # intent — we don't want a stale "1 prior decline" to trip the 2-strike
+        # farewell after the user has clearly come back into the conversation.
+        if intent not in ("objection", "farewell"):
+            self.state.decline_count = 0
+
         # =============================================================
         # STAGE-AWARE ROUTING
         # =============================================================
@@ -729,6 +1005,19 @@ class ConversationRouter:
         if intent == "objection" and self.state.stage != STAGE_GREETING:
             _cancel_llm()
             self.state.objection_handled = True
+            self.state.decline_count += 1
+
+            # Second decline: stop pushing and end gracefully.
+            if self.state.decline_count >= 2:
+                self.state.is_closing = True
+                self.state.stage = STAGE_CLOSING
+                resp = _DECLINE_FAREWELL_RESPONSES.get(
+                    self.state.language, _DECLINE_FAREWELL_RESPONSES["en"]
+                )
+                self.memory.add_assistant(resp)
+                yield EngineResult(text=resp, is_shortcut=True, intent="farewell")
+                return
+
             resp = self._pick_objection_response()
             self.memory.add_assistant(resp)
             yield EngineResult(text=resp, is_shortcut=True, intent="objection")
@@ -756,11 +1045,20 @@ class ConversationRouter:
             return
 
         # --- Language switch at any stage ---
+        # Highest-priority override: regardless of any prior lock, an explicit
+        # switch request immediately changes the output language. This handles
+        # the case "user says 'can you speak in English' while agent is in
+        # Hindi" — without this branch the agent stays stuck.
         if intent == "language_switch":
             _cancel_llm()
             new_lang = self._extract_requested_language(text)
+            logger.info(
+                "[LANG] Explicit switch request -> %s (was %s, locked=%s)",
+                new_lang, self.state.language, self.state.language_locked,
+            )
             self.state.language = new_lang
             self.state.language_locked = True
+            self.state.language_lock_turns = 0
             self.state.language_history = [new_lang] * 5
             resp = _LANG_SWITCH_RESPONSES.get(new_lang, _LANG_SWITCH_RESPONSES["hi"])
             self.memory.add_assistant(resp)
@@ -808,11 +1106,112 @@ class ConversationRouter:
                 self.state.language_locked = True
                 logger.info("[LANG] Locked language to %s from greeting response",
                             self.state.language)
+            # Silent NAME_CONFIRM passthrough → straight into PROJECT_CONFIRM.
+            # The user's first reply has already been recorded by memory.add_user
+            # earlier; name extraction (if any) lives in memory._extract_context.
+            # Replace this passthrough with an explicit name-ask once business
+            # finalises the wording.
             lang = self.state.language
-            interest = _INTEREST_LINE.get(lang, _INTEREST_LINE["hi"])
-            self.memory.add_assistant(interest)
-            self.state.stage = STAGE_INTEREST_CONFIRM
-            yield EngineResult(text=interest, is_shortcut=True, intent="interest_line")
+            resp = _PROJECT_CONFIRM_PROMPT.get(lang, _PROJECT_CONFIRM_PROMPT["en"])
+            self.memory.add_assistant(resp)
+            self.state.stage = STAGE_PROJECT_CONFIRM
+            yield EngineResult(text=resp, is_shortcut=True, intent="project_confirm_ask")
+            return
+
+        # =============================================================
+        # PROJECT CONFIRM — caller names the Pramukh project they're
+        # interested in. We accept any non-trivial reply as the project
+        # name (best-effort; LLM/system prompt fills in details on follow-up).
+        # =============================================================
+        if self.state.stage == STAGE_PROJECT_CONFIRM:
+
+            # User asks a question (e.g. "which projects do you have?") —
+            # let the LLM answer, then re-prompt for project on next turn.
+            if intent == "question":
+                self.state.llm_cancelled = False
+                async for result in self._consume_llm_with_filler(
+                    llm_queue, llm_done, intent, nudge_back=False,
+                ):
+                    yield result
+                return
+
+            # Capture project name when user gave a substantive answer.
+            # Skip pure affirmation/negation tokens — those aren't project names.
+            if intent not in ("affirmation", "negation", "greeting"):
+                cleaned = text.strip()
+                if cleaned and len(cleaned.split()) >= 1:
+                    self.memory.booking.project = cleaned
+
+            _cancel_llm()
+            self.state.stage = STAGE_PROPERTY_STATUS
+            lang = self.state.language
+            resp = _PROPERTY_STATUS_PROMPT.get(lang, _PROPERTY_STATUS_PROMPT["en"])
+            self.memory.add_assistant(resp)
+            yield EngineResult(text=resp, is_shortcut=True, intent="property_status_ask")
+            return
+
+        # =============================================================
+        # PROPERTY STATUS — ready-made vs under-construction
+        # =============================================================
+        if self.state.stage == STAGE_PROPERTY_STATUS:
+
+            if intent == "question":
+                self.state.llm_cancelled = False
+                async for result in self._consume_llm_with_filler(
+                    llm_queue, llm_done, intent, nudge_back=False,
+                ):
+                    yield result
+                return
+
+            status = _detect_property_status(text)
+            if status:
+                self.memory.booking.property_status = status
+
+            # Default to ready_made when caller skips/dodges — keeps the flow
+            # moving; the LLM can clarify later if it really matters.
+            if not self.memory.booking.property_status:
+                self.memory.booking.property_status = "ready_made"
+
+            _cancel_llm()
+            self.state.stage = STAGE_RENT_OR_BUY
+            lang = self.state.language
+            resp = _RENT_OR_BUY_PROMPT.get(lang, _RENT_OR_BUY_PROMPT["en"])
+            self.memory.add_assistant(resp)
+            yield EngineResult(text=resp, is_shortcut=True, intent="rent_or_buy_ask")
+            return
+
+        # =============================================================
+        # RENT OR BUY — caller's transaction intent. After this we deliver
+        # PROPERTY_INFO (the flat-and-condition pitch) and advance into the
+        # existing SCHEDULING flow.
+        # =============================================================
+        if self.state.stage == STAGE_RENT_OR_BUY:
+
+            if intent == "question":
+                self.state.llm_cancelled = False
+                async for result in self._consume_llm_with_filler(
+                    llm_queue, llm_done, intent, nudge_back=False,
+                ):
+                    yield result
+                return
+
+            txn = _detect_transaction_type(text)
+            if txn:
+                self.memory.booking.transaction_type = txn
+            if not self.memory.booking.transaction_type:
+                self.memory.booking.transaction_type = "buy"
+
+            _cancel_llm()
+            status = self.memory.booking.property_status or "ready_made"
+            info_dict = _PROPERTY_INFO_READY if status == "ready_made" else _PROPERTY_INFO_UNDER
+            lang = self.state.language
+            resp = info_dict.get(lang, info_dict["en"])
+            self.memory.add_assistant(resp)
+            # PROPERTY_INFO is a one-shot speech — the next user reply lands
+            # in SCHEDULING (the info ends with "would you like to schedule
+            # a site visit?", which makes that the natural next stage).
+            self.state.stage = STAGE_SCHEDULING
+            yield EngineResult(text=resp, is_shortcut=True, intent="property_info")
             return
 
         # =============================================================
@@ -1119,6 +1518,31 @@ class ConversationRouter:
         # CLOSING STAGE — allow re-engagement for new intents
         # =============================================================
         if self.state.stage == STAGE_CLOSING:
+            # Explicit re-engagement: user wants to schedule / book / change.
+            # Match keywords across English / Hindi / Gujarati / transliterated.
+            _closing_lower = text.lower()
+            if (
+                re.search(
+                    r"\b(schedule|book|booking|appointment|another|different|"
+                    r"reschedule|change|new\s+(?:appointment|slot|time|date))\b",
+                    _closing_lower,
+                )
+                or any(p in text for p in (
+                    "अपॉइंटमेंट", "अपोइंटमेंट", "एपॉइंटमेंट",
+                    "शेड्यूल", "नया", "नई", "फिर से", "फिर बुक",
+                    "बुक करो", "बुक करना", "दूसरा", "दूसरी",
+                    "એપોઇન્ટમેન્ટ", "શેડ્યુલ", "નવી", "નવો", "ફરીથી",
+                    "બુક કરો", "બીજો", "બીજી",
+                ))
+            ):
+                _cancel_llm()
+                self.state.is_closing = False
+                self.state.stage = STAGE_SCHEDULING
+                resp = self._get_proactive_prompt(STAGE_SCHEDULING)
+                self.memory.add_assistant(resp)
+                yield EngineResult(text=resp, is_shortcut=True, intent="reengage")
+                return
+
             # User wants to re-engage with a location or property
             if intent == "location_selection":
                 _cancel_llm()
@@ -1217,28 +1641,99 @@ class ConversationRouter:
         return None
 
     def _extract_time_preference(self, text: str) -> str | None:
+        """
+        Match user-stated time/day to an available slot.
+
+        Returns None when the user gave a SPECIFIC time that isn't on the
+        slot list — never silently fudges to a different slot. The engine's
+        scheduling reprompt path then offers the real available slots back.
+        """
         lower = text.lower()
-        for slot in _AVAILABLE_SLOTS:
-            day_l = slot["day"].lower()
-            time_l = slot["time"].lower()
-            if day_l in lower or time_l in lower:
+
+        # --- Step 1: extract specific hour if present ---
+        hour_24: int | None = None
+        # English "11 am", "6 pm", "5:00 pm"
+        m = re.search(r"\b(\d{1,2})(?::(\d{2}))?\s*(a\.?m\.?|p\.?m\.?)\b", lower)
+        if m:
+            h = int(m.group(1))
+            is_pm = "p" in m.group(3)
+            hour_24 = (h % 12) + (12 if is_pm else 0)
+        else:
+            # Hindi/Gujarati/transliterated: "11 बजे", "11 વાગે", "11 baje"
+            m = re.search(r"(\d{1,2})(?::(\d{2}))?\s*(?:बजे|वजे|વાગે|baje|baaje)", text)
+            if m:
+                h = int(m.group(1))
+                is_evening = bool(re.search(
+                    r"(शाम|સાંજે|saanje|shaam|evening|night|रात|રાત)", text + lower))
+                is_afternoon = bool(re.search(
+                    r"(दोपहर|બપોરે|bapore|dopahar|afternoon)", text + lower))
+                is_morning = bool(re.search(
+                    r"(सुबह|સવારે|savare|subah|morning)", text + lower))
+                if is_evening or is_afternoon:
+                    hour_24 = (h % 12) + 12
+                elif is_morning:
+                    hour_24 = h % 12 if h != 12 else 12
+                else:
+                    # Default heuristic: 1-7 → PM (afternoon/evening),
+                    # 8-12 → AM (morning) — fits typical site-visit phrasing
+                    hour_24 = (h % 12) + (12 if 1 <= h <= 7 else 0)
+
+        # --- Step 2: extract day ---
+        day: str | None = None
+        if re.search(r"\b(today|aaj|aaje)\b", lower) or "आज" in text or "આજે" in text:
+            day = "Today"
+        elif (re.search(r"\b(tomorrow|kal|kaale)\b", lower)
+              or "कल" in text or "કાલે" in text):
+            day = "Tomorrow"
+        elif (re.search(r"\b(parso|parson|day after tomorrow)\b", lower)
+              or "परसों" in text or "परसो" in text
+              or "પરમ" in text or "પરસું" in text or "પરસો" in text):
+            day = "Day after tomorrow"
+        elif re.search(r"\b(saturday|this saturday|weekend)\b", lower):
+            day = "This Saturday"
+
+        # --- Step 3: if specific time given, match strictly against slots ---
+        if hour_24 is not None:
+            for slot in _AVAILABLE_SLOTS:
+                if day and slot["day"] != day:
+                    continue
+                if _slot_hour_24(slot["time"]) == hour_24:
+                    return f"{slot['day']} at {slot['time']}"
+            # User gave a specific hour with no matching slot — caller will
+            # reprompt with available options instead of locking a wrong time.
+            return None
+
+        # --- Step 4: no specific hour. Match by part-of-day + day. ---
+        period: str | None = None
+        if re.search(r"(सुबह|સવારે|savare|subah|morning)", text + lower):
+            period = "morning"
+        elif re.search(r"(दोपहर|બપોરે|bapore|dopahar|afternoon)", text + lower):
+            period = "afternoon"
+        elif re.search(r"(शाम|સાંજે|saanje|shaam|evening|night)", text + lower):
+            period = "evening"
+
+        if day or period:
+            for slot in _AVAILABLE_SLOTS:
+                if day and slot["day"] != day:
+                    continue
+                if period and _slot_period(slot["time"]) != period:
+                    continue
                 return f"{slot['day']} at {slot['time']}"
-        for keyword in ["morning", "subah", "savare", "सुबह", "સવારે"]:
-            if keyword in lower:
-                return "Tomorrow at 10:00 AM"
-        for keyword in ["afternoon", "dopahar", "bapore", "दोपहर", "બપોરે"]:
-            if keyword in lower:
-                return "Tomorrow at 2:00 PM"
-        for keyword in ["evening", "shaam", "saanje", "शाम", "સાંજે"]:
-            if keyword in lower:
-                return "Tomorrow at 2:00 PM"
-        if re.search(r"\b(tomorrow|kal|kaale|कल|કાલે)\b", lower):
-            return "Tomorrow at 10:00 AM"
-        if re.search(r"\b(saturday|weekend|this saturday)\b", lower):
-            return "This Saturday at 10:00 AM"
-        # For affirmation in scheduling context, pick the first available slot
-        if re.search(r"\b(yes|ok|sure|haan|ha|ji|theek|first|pehla)\b", lower):
+            # Day matched but period didn't (e.g. user wants "Tomorrow evening"
+            # — no evening slots tomorrow). Don't fudge: caller reprompts.
+            if period:
+                return None
+            # Day-only match: take the first slot of that day.
+            for slot in _AVAILABLE_SLOTS:
+                if slot["day"] == day:
+                    return f"{slot['day']} at {slot['time']}"
+
+        # --- Step 5: bare affirmation → first available slot ---
+        if re.search(r"\b(yes|yeah|ok|okay|sure|haan|ha|ji|theek|first|pehla)\b", lower):
             return f"{_AVAILABLE_SLOTS[0]['day']} at {_AVAILABLE_SLOTS[0]['time']}"
+        if any(w in text for w in ("ठीक", "हां", "हाँ", "જી", "હા", "બરાબર", "ઠીક")):
+            return f"{_AVAILABLE_SLOTS[0]['day']} at {_AVAILABLE_SLOTS[0]['time']}"
+
         return None
 
     # ------------------------------------------------------------------
@@ -1482,15 +1977,30 @@ class ConversationRouter:
             "",
             f"CURRENT BOOKING STATE:",
             f"- Stage: {self.state.stage}",
+            f"- Project: {b.project or 'not confirmed yet'}",
+            f"- Property status: {b.property_status or 'not confirmed yet'} (ready-made vs under-construction)",
+            f"- Transaction type: {b.transaction_type or 'not confirmed yet'} (rent vs buy)",
             f"- Location: {b.location or 'not selected yet'}",
             f"- Property type: {b.property_type or 'not selected yet'}",
             f"- Appointment: {b.appointment_time or 'not scheduled yet'}",
+            "",
+            "CALL FLOW (you must drive the caller through these steps in order):",
+            "  1. Good-afternoon greeting (already delivered).",
+            "  2. Name confirmation (currently silent placeholder — skip until business finalises wording).",
+            "  3. Confirm which Pramukh Group project they're interested in.",
+            "  4. Ready-made vs under-construction.",
+            "  5. For rent or to buy.",
+            "  6. Inform them about the available flats and condition (matched to status).",
+            "  7. Schedule a site visit.",
             "",
             "LOCATIONS & KEY SELLING POINTS:",
             "- Surat: Gujarat's diamond city, booming IT hub, excellent infrastructure, 2-5 BHK from ₹35L-₹1.5Cr",
             "- Vapi: Industrial growth corridor, close to Mumbai, affordable luxury, 2-4 BHK from ₹25L-₹85L",
             "- Silvassa: Peaceful green living near Vapi, nature surroundings, weekend home destination, 2-3 BHK from ₹20L-₹60L",
             "PROPERTY TYPES: 2 BHK, 3 BHK, 4 BHK, 5 BHK — all with modern amenities, parking, garden, security",
+            "READY-MADE vs UNDER-CONSTRUCTION:",
+            "- Ready-made: fully finished, modern interiors, all amenities active, immediate move-in.",
+            "- Under-construction: pre-launch pricing, modern designs, flexible payment plans, possession in 18-24 months.",
             "",
             "YOUR IDENTITY:",
             "- You are calling on behalf of Pramukh Group, a well-known real estate developer in Gujarat.",
@@ -1514,7 +2024,26 @@ class ConversationRouter:
             "- Be polite, respectful, and proactive. Respect the user's time.",
             "- Use formal address (aap/tamne) in Hindi/Gujarati.",
             "- NEVER lose sight of the goal: get them excited about properties and book a site visit.",
+            "- Match the caller's language exactly. If they switch to a different language mid-call, switch with them — do NOT refuse.",
         ]
+
+        # NEVER-REFUSE rule — applies to every language. The agent must never
+        # claim it can only speak one language or refuse to switch. Language
+        # switching is handled deterministically upstream; if the LLM is being
+        # invoked at all, the chosen language is already correct, so the model
+        # must simply use it without commenting on its own language abilities.
+        never_refuse = (
+            "\n*** NEVER REFUSE A LANGUAGE — CRITICAL ***"
+            "\nYou are FLUENT in Hindi, Gujarati, AND English. You can switch freely between any of them."
+            "\nYou MUST NEVER say or imply that you can only speak one language."
+            "\nForbidden phrasings (DO NOT produce these or any paraphrase):"
+            "\n  - \"I can only speak/talk in [language]\""
+            "\n  - \"मैं सिर्फ हिंदी में बात कर सकता हूँ\" / \"मैं हिंदी में ही बात करूँगा\" / \"मुझे केवल हिंदी आती है\""
+            "\n  - \"હું ફક્ત ગુજરાતી માં વાત કરી શકું છું\" / \"હું ગુજરાતી માં જ વાત કરીશ\""
+            "\n  - \"main sirf hindi mai baat kar sakta hu\" / \"hu fakt gujarati ma vaat karu chu\""
+            "\n  - Any sentence that names a language and says you can ONLY use it, or that you will ONLY/ही/જ/only continue in it."
+            "\nIf the caller mentions any language difficulty or preference, simply continue helpfully in the language the system has already selected — do NOT comment on your own language capabilities or restrictions."
+        )
 
         lang_instruction = {
             "hi": (
@@ -1524,6 +2053,7 @@ class ConversationRouter:
                 f"\nDo NOT write in Gujarati script (ગુજરાતી) or English."
                 f"\nEven if previous messages were in Gujarati, respond in Hindi NOW."
                 f"\nThis instruction overrides all conversation history."
+                f"{never_refuse}"
             ),
             "gu": (
                 f"\n*** LANGUAGE: GUJARATI — THIS IS THE HIGHEST PRIORITY RULE ***"
@@ -1532,6 +2062,7 @@ class ConversationRouter:
                 f"\nDo NOT write in Hindi/Devanagari (हिन्दी) or English."
                 f"\nEven if previous messages were in Hindi, respond in Gujarati NOW."
                 f"\nThis instruction overrides all conversation history."
+                f"{never_refuse}"
             ),
             "en": (
                 f"\n*** LANGUAGE: ENGLISH — THIS IS THE HIGHEST PRIORITY RULE ***"
@@ -1539,6 +2070,7 @@ class ConversationRouter:
                 f"\nDo NOT write in Hindi or Gujarati."
                 f"\nEven if previous messages were in another language, respond in English NOW."
                 f"\nThis instruction overrides all conversation history."
+                f"{never_refuse}"
             ),
         }
         parts.append(lang_instruction.get(self.state.language, lang_instruction["hi"]))
@@ -1580,7 +2112,10 @@ class ConversationRouter:
                 lang = "hi" if hi_score >= gu_score else "gu"
                 result = (lang, max(confidence, 0.5), "pattern")
             elif text_lower.isascii():
-                result = ("hi", 0.5, "default")
+                # ASCII text with zero Hindi/Gujarati pattern hits is overwhelmingly
+                # English. Defaulting to "hi" here forced English speakers into
+                # Devanagari STT on the next turn.
+                result = ("en", 0.5, "default")
             else:
                 lang = await self._classify_language_llm(text_lower)
                 result = (lang, 0.9, "llm")
@@ -1590,7 +2125,13 @@ class ConversationRouter:
 
     @staticmethod
     def _has_gujarati_markers_devanagari(text: str) -> bool:
-        """Detect Gujarati words written in Devanagari by STT."""
+        """Detect Gujarati words written in Devanagari by STT.
+
+        Requires at least 2 distinct markers to avoid flipping language on a
+        single mishearing — words like 'माने' / 'छे' can appear in Hindi
+        utterances or as STT noise and shouldn't single-handedly switch the
+        agent to Gujarati.
+        """
         markers = [
             "छे", "छु", "छो", "छीए", "छुं",
             "जोइए", "जोईए", "जोइये",
@@ -1604,7 +2145,8 @@ class ConversationRouter:
             "जोवा", "जोई", "जोवुं",
             "बतावो", "जणावो",
         ]
-        return any(m in text for m in markers)
+        hits = sum(1 for m in markers if m in text)
+        return hits >= 2
 
     async def _classify_language_llm(self, text: str) -> str:
         try:
@@ -1630,14 +2172,100 @@ class ConversationRouter:
 
     def _extract_requested_language(self, text: str) -> str:
         lower = text.lower()
-        if any(w in lower for w in ["hindi", "हिंदी", "हिन्दी", "હિન્દી"]):
-            return "hi"
-        if any(w in lower for w in ["gujarati", "ગુજરાતી", "गुजराती", "ગુજરાતી"]):
-            return "gu"
-        if any(w in lower for w in [
-            "english", "इंग्लिश", "अंग्रेज़ी", "अंग्रेजी",
-            "અંગ્રેજી", "ઇંગ્લિશ", "angrezi", "inglish",
-        ]):
+
+        # Identify negated languages up front so they don't leak into
+        # instead/directive/last-position resolution. "I can't speak Hindi"
+        # contains "speak hindi" which would otherwise match the directive
+        # regex and route to Hindi — the opposite of what the user wants.
+        _lang_alt = (
+            r"english|hindi|gujarati|inglish|angrezi|"
+            r"इंग्लिश|अंग्रेज़ी|अंग्रेजी|हिंदी|हिन्दी|गुजराती|"
+            r"ગુજરાતી|અંગ્રેજી|હિન્દી|ઇંગ્લિશ"
+        )
+        _neg_after = r"(?:नहीं|नहि|नही|न्ही|નથી|નહિ|નહી|નહીં|nahi|nahin|nai)"
+        _neg_before_en = r"(?:don'?t|do not|can'?t|cannot)\s+(?:know|speak|talk|understand)?"
+        _name_to_code = {
+            "english": "en", "angrezi": "en", "inglish": "en",
+            "hindi": "hi", "gujarati": "gu",
+            "इंग्लिश": "en", "अंग्रेज़ी": "en", "अंग्रेजी": "en",
+            "ઇંગ્લિશ": "en", "અંગ્રેજી": "en",
+            "हिंदी": "hi", "हिन्दी": "hi", "હિન્દી": "hi",
+            "ગુજરાતી": "gu", "गुजराती": "gu",
+        }
+        negated: set[str] = set()
+        for pat in (
+            rf"({_lang_alt})\s{{0,3}}{_neg_after}",
+            rf"{_neg_before_en}\s+({_lang_alt})",
+        ):
+            for m in re.finditer(pat, text, re.IGNORECASE):
+                key = m.group(1)
+                code = _name_to_code.get(key) or _name_to_code.get(key.lower())
+                if code:
+                    negated.add(code)
+
+        # "X instead of Y" / "X not Y" / "X rather than Y" — the language
+        # BEFORE the marker is the preferred one. Check this first because the
+        # generic directive regex below would otherwise match "of Y" / "to Y".
+        instead_match = re.search(
+            r"(english|hindi|gujarati|angrezi|inglish)\s+(?:instead\s+of|not|rather\s+than|over|than)\s+(english|hindi|gujarati|angrezi|inglish)?",
+            lower,
+        )
+        if instead_match:
+            preferred = instead_match.group(1)
+            code = {
+                "english": "en", "angrezi": "en", "inglish": "en",
+                "hindi": "hi", "gujarati": "gu",
+            }[preferred]
+            if code not in negated:
+                return code
+
+        # Prefer language names that follow a directive word — the destination
+        # of "speak in X" / "switch to X" / "talk X" is what the user wants.
+        directive_match = re.search(
+            r"(?:speak|talk|switch|continue|reply|use|change|in|to|me|mai|mein|ma|mei)\s+(?:in\s+|to\s+)?(english|hindi|gujarati|angrezi|inglish)",
+            lower,
+        )
+        if directive_match:
+            target = directive_match.group(1)
+            code = {
+                "english": "en", "angrezi": "en", "inglish": "en",
+                "hindi": "hi", "gujarati": "gu",
+            }[target]
+            if code not in negated:
+                return code
+
+        # Fallback: pick the LAST language name mentioned. Handles cases like
+        # "switch from hindi to english" → returns en correctly.
+        positions: list[tuple[int, str]] = []
+        for word, code in [
+            ("english", "en"), ("angrezi", "en"), ("inglish", "en"),
+            ("hindi", "hi"), ("gujarati", "gu"),
+        ]:
+            idx = lower.rfind(word)
+            if idx >= 0:
+                positions.append((idx, code))
+        for word, code in [
+            ("इंग्लिश", "en"), ("अंग्रेज़ी", "en"), ("अंग्रेजी", "en"),
+            ("અંગ્રેજી", "en"), ("ઇંગ્લિશ", "en"),
+            ("हिंदी", "hi"), ("हिन्दी", "hi"), ("હિન્દી", "hi"),
+            ("ગુજરાતી", "gu"), ("गुजराती", "gu"),
+        ]:
+            idx = text.rfind(word)
+            if idx >= 0:
+                positions.append((idx, code))
+        if positions:
+            positions.sort(reverse=True)
+            for _, code in positions:
+                if code not in negated:
+                    return code
+            # All mentioned languages were negated — keep current language
+            # if it's not the negated one; otherwise fall back to script.
+            if self.state.language not in negated:
+                return self.state.language
+            if any("઀" <= ch <= "૿" for ch in text):
+                return "gu"
+            if any("ऀ" <= ch <= "ॿ" for ch in text):
+                return "hi"
             return "en"
         return self.state.language
 

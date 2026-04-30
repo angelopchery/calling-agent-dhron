@@ -53,7 +53,38 @@ _REPEATED_CHAR_RE = re.compile(r"^(.{1,3}[- ]?)\1{2,}[-]?$")
 
 _GARBAGE_SINGLE_WORDS = {
     "shoe", "care", "shoes", "show", "sure",
+    # Common single-word noise transcriptions Sarvam emits on near-silence
+    "the", "a", "an", "is", "it", "to", "of", "huh", "hmm", "uh", "um",
+    "ah", "oh", "you", "yeah", "well",
 }
+
+# Single Devanagari/Gujarati tokens that frequently surface as STT garbage on
+# noise/breath/clicks. Rejecting them prevents a single mishearing from
+# flipping the conversation language.
+_GARBAGE_SCRIPT_TOKENS = {
+    "अ", "आ", "ओ", "ओके", "हा", "ना", "न", "ह", "ओ के",
+    "અ", "આ", "ઓ", "હા", "ના",
+}
+
+# Unicode blocks the agent SUPPORTS: Latin (en), Devanagari (hi), Gujarati (gu).
+# Anything else (Kannada / Tamil / Telugu / Malayalam / Gurmukhi / Bengali /
+# Oriya / Sinhala / Arabic / Tibetan / etc.) is a Sarvam auto-detect mis-fire
+# on noisy or short audio and gets rejected as a hallucination.
+_UNSUPPORTED_SCRIPT_RE = re.compile(
+    r"["
+    r"ঀ-৿"  # Bengali
+    r"਀-੿"  # Gurmukhi (Punjabi)
+    r"଀-୿"  # Oriya
+    r"஀-௿"  # Tamil
+    r"ఀ-౿"  # Telugu
+    r"ಀ-೿"  # Kannada
+    r"ഀ-ൿ"  # Malayalam
+    r"඀-෿"  # Sinhala
+    r"؀-ۿ"  # Arabic
+    r"ༀ-࿿"  # Tibetan
+    r"က-႟"  # Myanmar
+    r"]"
+)
 
 
 def validate_transcript(text: str) -> str:
@@ -77,6 +108,13 @@ def validate_transcript(text: str) -> str:
     # Length check
     if len(cleaned) < 2:
         logger.info("[STT-FILTER] reason=too_short text=%r", text)
+        return ""
+
+    # Unsupported-script filter — Sarvam's auto-detect ("unknown" lang) sometimes
+    # transcribes noisy audio into Kannada / Punjabi / Malayalam / Tamil /
+    # Bengali / etc. Those scripts are never user input for this agent.
+    if _UNSUPPORTED_SCRIPT_RE.search(text):
+        logger.info("[STT-FILTER] reason=unsupported_script text=%r", text)
         return ""
 
     # Hallucination filter
@@ -110,6 +148,13 @@ def validate_transcript(text: str) -> str:
     # Single-word garbage: common misrecognitions from noise
     if len(words) == 1 and cleaned in _GARBAGE_SINGLE_WORDS:
         logger.info("[STT-FILTER] reason=garbage_single_word text=%r", text)
+        return ""
+
+    # Single Devanagari/Gujarati script garbage tokens (raw text, not cleaned —
+    # the lower/strip pass mangles non-ASCII script and we want exact match).
+    raw_stripped = text.strip()
+    if raw_stripped in _GARBAGE_SCRIPT_TOKENS:
+        logger.info("[STT-FILTER] reason=garbage_script_token text=%r", text)
         return ""
 
     return cleaned

@@ -61,8 +61,16 @@ class SarvamSTT(STTProvider):
         duration_ms = len(audio_bytes) // (sample_rate * 2) * 1000
         logger.info("[STT:Sarvam] Sending %d bytes (%.0fms) for transcription", len(wav_data), duration_ms)
 
-        # Language mapping: "en" → "en-IN", "hi" → "hi-IN"
-        lang_code = language if "-" in language else f"{language}-IN"
+        # Language mapping:
+        # - "unknown" → pass through, Sarvam auto-detects
+        # - "en" → "en-IN", "hi" → "hi-IN"
+        # - already-suffixed codes pass through
+        if language == "unknown":
+            lang_code = "unknown"
+        elif "-" in language:
+            lang_code = language
+        else:
+            lang_code = f"{language}-IN"
 
         client = self._get_client()
 
@@ -93,6 +101,22 @@ class SarvamSTT(STTProvider):
         confidence = float(data.get("confidence", 1.0))
         logger.info("[STT:Sarvam] Transcript: %r (confidence=%.2f)", transcript, confidence)
         return STTResult(text=transcript, confidence=confidence)
+
+    async def warmup(self) -> None:
+        """Pre-open a TLS connection to the Sarvam host so the first real
+        transcribe() call doesn't pay DNS+TCP+TLS cost (~300ms cold start).
+
+        We fire a cheap HEAD request — Sarvam returns 404/405 for it, but the
+        connection lands in httpx's per-host pool and the next POST reuses it.
+        Errors are silently ignored.
+        """
+        try:
+            import asyncio
+            client = self._get_client()
+            await asyncio.wait_for(client.head(self._api_url), timeout=3.0)
+            logger.info("[STT:Sarvam] Connection warmed")
+        except Exception as exc:
+            logger.debug("[STT:Sarvam] Warmup skipped: %s", exc)
 
     async def close(self) -> None:
         if self._client:

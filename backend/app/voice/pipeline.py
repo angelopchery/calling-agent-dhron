@@ -26,6 +26,7 @@ from .tts_sarvam import SarvamTTS
 from .turn_manager import TurnManager, TurnManagerConfig
 from .conversation import ConversationRouter
 from .memory import ConversationMemory
+from .event_hub import EventHub
 
 logger = logging.getLogger(__name__)
 
@@ -62,10 +63,17 @@ QUEUE_SIZE_TTS = 5
 
 MAX_SPEECH_SECONDS = 4
 MAX_BUFFER_BYTES = SAMPLE_RATE * 2 * MAX_SPEECH_SECONDS
-MIN_SPEECH_MS = 400.0
+# Bumped 400→500ms: shorter utterances frequently produced single-word
+# garbage transcripts that flipped the language detector.
+MIN_SPEECH_MS = 500.0
 BARGE_IN_COOLDOWN_MS = 400.0
-BARGE_IN_MIN_FRAMES = 25
+BARGE_IN_MIN_FRAMES = 40
 TTS_ECHO_COOLDOWN_MS = 1000.0
+# Sustained-frame counts for hysteresis. Bumped 3→4 onset / 5→6 silence
+# so a momentary mic spike (key click, breath, lip smack) doesn't spawn a
+# spurious turn that the STT then transcribes as a wrong-language token.
+SPEECH_ONSET_MIN_FRAMES = 4
+SPEECH_HOLD_MIN_FRAMES = 6
 
 
 class VoicePipeline:
@@ -83,12 +91,15 @@ class VoicePipeline:
         stt: STTRouter | None = None,
         tts: StreamingTTS | None = None,
         conversation: ConversationRouter | None = None,
+        event_hub: EventHub | None = None,
+        mic_enabled: bool = False,
     ) -> None:
         self.audio = audio_source or MicrophoneStream()
         self.vad = vad or VoiceActivityDetector()
         self.stt = stt or STTRouter()
         self.tts = tts or SarvamTTS()
         self.conversation = conversation or ConversationRouter()
+        self._hub = event_hub
 
         # Inter-layer queues
         self._stt_queue: asyncio.Queue[AudioSegment] = asyncio.Queue(maxsize=QUEUE_SIZE_STT)
@@ -103,6 +114,7 @@ class VoicePipeline:
         self._tts_end_time = 0.0
         self._vad_mute_until = 0.0
         self._barge_in_occurred = False
+        self._mic_enabled = mic_enabled
 
         # VAD + buffering state
         self._audio_buffer = bytearray()
@@ -127,6 +139,15 @@ class VoicePipeline:
         logger.info("[PIPELINE] Starting voice pipeline")
         logger.info("=" * 60)
 
+        # Fire-and-forget connection warm-ups so the first user turn doesn't
+        # pay TLS handshake cost (~300ms each). Failures are silently ignored.
+        warmup_targets = []
+        primary_stt = getattr(self.stt, "_primary", None)
+        if primary_stt is not None and hasattr(primary_stt, "warmup"):
+            warmup_targets.append(("stt_primary", primary_stt.warmup()))
+        for name, coro in warmup_targets:
+            asyncio.create_task(coro, name=f"warm_{name}")
+
         self._tasks = [
             asyncio.create_task(self._audio_vad_layer(), name="audio_vad"),
             asyncio.create_task(self._stt_worker(), name="stt_worker"),
@@ -143,6 +164,14 @@ class VoicePipeline:
                 timestamp=time.monotonic(),
             ))
             logger.info("[PIPELINE] Agent opening: %r", opening.text)
+            if self._hub is not None:
+                self._hub.emit_nowait({
+                    "type": "agent",
+                    "text": opening.text,
+                    "llm_latency_ms": 0,
+                    "first_chunk_ms": 0,
+                    "total_latency_ms": 0,
+                })
         except asyncio.QueueFull:
             logger.warning("[PIPELINE] Could not enqueue opening greeting")
 
@@ -202,12 +231,44 @@ class VoicePipeline:
         finally:
             logger.info("[AUDIO] Layer stopped (%d frames)", self._frame_count)
 
+    @property
+    def mic_enabled(self) -> bool:
+        return self._mic_enabled
+
+    def set_mic_enabled(self, enabled: bool) -> None:
+        """Toggle mic gating. When disabled, frames are discarded before VAD —
+        no calibration progress, no speech detection, no barge-in."""
+        if enabled == self._mic_enabled:
+            return
+        self._mic_enabled = enabled
+        logger.info("[MIC] %s", "enabled" if enabled else "disabled")
+        if not enabled:
+            # Drop any in-flight speech buffer so a partial utterance doesn't
+            # get committed when the mic comes back on.
+            self._reset_vad_state()
+            self._speech_frame_streak = 0
+        if self._hub is not None:
+            self._hub.emit_nowait({"type": "mic_state", "enabled": enabled})
+
     async def _process_vad_frame(self, frame: bytes) -> None:
+        # Mic gate: skip speech detection / barge-in while disabled, but keep
+        # advancing VAD calibration on disabled-period ambient. Otherwise the
+        # first ~600ms of speech after the user enables mic is silently
+        # consumed by the calibration window. is_speech() returns False during
+        # calibration, so this never triggers downstream processing.
+        if not self._mic_enabled:
+            if not self.vad.calibrated:
+                self.vad.is_speech(frame)
+            return
+
         raw_speech = self.vad.is_speech(frame)
 
         # === FULL MUTE while TTS is playing — only allow barge-in ===
+        # Barge-in uses a stricter threshold than turn-detection so TTS
+        # echo / ambient noise can't masquerade as a sustained interrupt.
         if self._tts_playing:
-            if raw_speech:
+            loud = self.vad.last_energy > self.vad.barge_in_threshold
+            if loud:
                 self._speech_frame_streak += 1
             else:
                 self._speech_frame_streak = 0
@@ -215,8 +276,8 @@ class VoicePipeline:
             elapsed = (time.monotonic() - self._tts_start_time) * 1000
             if (self._speech_frame_streak >= BARGE_IN_MIN_FRAMES
                     and elapsed > BARGE_IN_COOLDOWN_MS):
-                logger.info("[BARGE-IN] Sustained speech (%d frames) — interrupting TTS",
-                            self._speech_frame_streak)
+                logger.info("[BARGE-IN] Sustained loud speech (%d frames, energy=%.0f, thr=%.0f) — interrupting TTS",
+                            self._speech_frame_streak, self.vad.last_energy, self.vad.barge_in_threshold)
                 await self.tts.stop()
                 self._tts_playing = False
                 self._barge_in_occurred = True
@@ -247,9 +308,9 @@ class VoicePipeline:
             self._silence_frames += 1
             self._speech_onset_frames = 0
 
-        if raw_speech and self._speech_onset_frames < 3 and not self._prev_speech:
+        if raw_speech and self._speech_onset_frames < SPEECH_ONSET_MIN_FRAMES and not self._prev_speech:
             speech = False
-        elif not raw_speech and self._silence_frames < 5 and self._prev_speech:
+        elif not raw_speech and self._silence_frames < SPEECH_HOLD_MIN_FRAMES and self._prev_speech:
             speech = True
         else:
             speech = raw_speech
@@ -337,9 +398,13 @@ class VoicePipeline:
 
             try:
                 latency_start = time.monotonic()
-                language = self.conversation.state.language if self.conversation else "en"
+                # STT always auto-detects. Forcing a language here was the
+                # root cause of broken mid-call switching: when locked to
+                # Hindi, English audio was transcribed as Devanagari junk,
+                # so the language-switch intent never matched. Output language
+                # is governed by the conversation engine, not STT input.
                 transcript_text = await self.stt.transcribe(
-                    segment.audio, sample_rate=SAMPLE_RATE, language=language
+                    segment.audio, sample_rate=SAMPLE_RATE, language="unknown",
                 )
                 stt_latency = (time.monotonic() - latency_start) * 1000
 
@@ -348,6 +413,13 @@ class VoicePipeline:
                     continue
 
                 logger.info("[STT] %r (%.0fms latency)", transcript_text, stt_latency)
+
+                if self._hub is not None:
+                    self._hub.emit_nowait({
+                        "type": "user",
+                        "text": transcript_text.strip(),
+                        "stt_latency_ms": round(stt_latency),
+                    })
 
                 transcript = Transcript(
                     text=transcript_text.strip(),
@@ -414,6 +486,15 @@ class VoicePipeline:
                     logger.info("[ENGINE] %r -> %r (%.0fms, first_chunk=%.0fms)",
                                 transcript.text, full_text, engine_latency, first_chunk_ms)
 
+                    if self._hub is not None:
+                        self._hub.emit_nowait({
+                            "type": "agent",
+                            "text": full_text,
+                            "llm_latency_ms": round(engine_latency),
+                            "first_chunk_ms": round(first_chunk_ms),
+                            "total_latency_ms": round(total_latency),
+                        })
+
                     state = self.conversation.state
                     turn_metric = {
                         "turn_id": state.turn_count,
@@ -470,9 +551,13 @@ class VoicePipeline:
             except asyncio.CancelledError:
                 break
 
-            # Drop stale responses that have been sitting in queue too long
+            # Drop genuinely-orphaned responses. Cap is intentionally generous:
+            # a multi-sentence streamed response can spend tens of seconds in
+            # the queue waiting for earlier chunks to finish speaking. Barge-in
+            # already drains this queue via _flush_pipeline_queues(), so this
+            # cap only fires on genuinely stuck pipelines.
             age_ms = (time.monotonic() - response.timestamp) * 1000
-            if age_ms > 3000:
+            if age_ms > 30000:
                 logger.warning("[TTS] Dropping stale response (%.0fms old): %r",
                                age_ms, response.text[:50])
                 continue

@@ -152,7 +152,7 @@ class MicrophoneStream(AudioInputStream):
         sample_rate: int = SAMPLE_RATE,
         frame_duration_ms: int = FRAME_DURATION_MS,
         queue_max_size: int = 200,
-        noise_suppression: bool = True,
+        noise_suppression: bool = False,
     ) -> None:
         super().__init__(sample_rate=sample_rate, frame_duration_ms=frame_duration_ms)
         self._device = device

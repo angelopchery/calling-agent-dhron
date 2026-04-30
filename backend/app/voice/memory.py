@@ -33,9 +33,21 @@ class BookingData:
     appointment_time: str | None = None
     user_name: str | None = None
     confirmed: bool = False
+    # New fields driven by the project / status / rent-or-buy flow
+    project: str | None = None              # caller-named Pramukh project
+    property_status: str | None = None      # "ready_made" / "under_construction"
+    transaction_type: str | None = None     # "rent" / "buy"
 
     def summary(self) -> str:
         parts = []
+        if self.user_name:
+            parts.append(f"Name: {self.user_name}")
+        if self.project:
+            parts.append(f"Project: {self.project}")
+        if self.property_status:
+            parts.append(f"Status: {self.property_status}")
+        if self.transaction_type:
+            parts.append(f"Intent: {self.transaction_type}")
         if self.location:
             parts.append(f"Location: {self.location}")
         if self.property_type:
@@ -44,8 +56,6 @@ class BookingData:
             parts.append(f"Date: {self.appointment_date}")
         if self.appointment_time:
             parts.append(f"Time: {self.appointment_time}")
-        if self.user_name:
-            parts.append(f"Name: {self.user_name}")
         return ", ".join(parts) if parts else "No details yet"
 
     def next_missing_field(self) -> str | None:

@@ -60,14 +60,16 @@ class OpenAIWhisperSTT(STTProvider):
         logger.info("[STT:Whisper] Sending %d bytes (%.0fms) for transcription", len(wav_data), duration_ms)
 
         client = self._get_client()
-        # language code for Whisper is ISO-639-1 (e.g. "en", "hi")
-        lang = language.split("-")[0] if "-" in language else language
+        # language code for Whisper is ISO-639-1 (e.g. "en", "hi").
+        # "unknown" means: omit the parameter so Whisper auto-detects.
+        kwargs: dict = {
+            "model": self._model,
+            "file": ("audio.wav", wav_data, "audio/wav"),
+        }
+        if language and language != "unknown":
+            kwargs["language"] = language.split("-")[0] if "-" in language else language
 
-        result = await client.audio.transcriptions.create(
-            model=self._model,
-            file=("audio.wav", wav_data, "audio/wav"),
-            language=lang,
-        )
+        result = await client.audio.transcriptions.create(**kwargs)
 
         transcript = result.text.strip()
         logger.info("[STT:Whisper] Transcript: %r", transcript)

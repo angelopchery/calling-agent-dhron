@@ -42,6 +42,20 @@ _CITY_CORRECTIONS: dict[str, str] = {
     "silwasa": "silvassa",
     "silvassa": "silvassa",
     "dadra": "silvassa",
+    # --- Devanagari / Gujarati script mishearings of city names ---
+    # Vapi
+    "वापी": "vapi", "वापि": "vapi", "बाबी": "vapi", "वाबी": "vapi",
+    "वआपी": "vapi", "वापीे": "vapi", "वापिए": "vapi",
+    "વાપી": "vapi", "વાપિ": "vapi", "બાપી": "vapi", "વાબી": "vapi",
+    # Surat
+    "सूरत": "surat", "सुरत": "surat", "सूरत्": "surat",
+    "સુરત": "surat", "સૂરત": "surat",
+    # Silvassa
+    "सिलवासा": "silvassa", "सिलवासआ": "silvassa", "सिल्वासा": "silvassa",
+    "સિલવાસા": "silvassa", "સિલ્વાસા": "silvassa",
+    # Note: deliberately NOT mapping ambiguous Devanagari words like "अभी"
+    # (= "now") or "आप ही" (= "yourself/you") to vapi — they're real
+    # words and would over-trigger outside location context.
 }
 
 _CANONICAL_CITIES = {"surat", "vapi", "silvassa"}
